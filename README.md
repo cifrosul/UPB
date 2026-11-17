@@ -7,7 +7,6 @@ A lightweight, zero-dependency Windows system tray utility that displays live ba
 - **Standard USB HID Battery Peripherals** (devices implementing standard HID Battery Status Page `0x85`)
 - **Custom Configurable Receivers** via `config.json`
 
-> **Note**: This is an updated universal version located in its own dedicated directory. The original single-purpose monitor in `PeripheralBatteryMonitor\` remains completely untouched.
 
 ---
 
@@ -43,6 +42,12 @@ A lightweight, zero-dependency Windows system tray utility that displays live ba
    - View all discovered wireless peripherals at a glance, along with connection type (Bluetooth, 2.4G Dongle, USB), battery percentage, status, and device ID.
 
 ---
+
+<img width="263" height="235" alt="image" src="https://github.com/user-attachments/assets/d6ff33d7-94c2-4ae9-8794-2189f92cf279" />
+<img width="336" height="174" alt="image" src="https://github.com/user-attachments/assets/f2908049-4fb2-41ec-a5a1-5e76f958ec0e" />
+<img width="201" height="114" alt="image" src="https://github.com/user-attachments/assets/3d12acf9-5d39-401e-9d70-8229768eac80" />
+
+
 
 ## Quick Start
 
