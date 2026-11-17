@@ -1,0 +1,2370 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+namespace UniversalPeripheralBatteryMonitor
+{
+    static class Program
+    {
+        private const string AppGuid = "Global\\UniversalPeripheralBatteryMonitor_AppMutex_v2";
+
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
+        [STAThread]
+        static void Main(string[] args)
+        {
+            try
+            {
+                SetProcessDPIAware();
+            }
+            catch { }
+
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
+            {
+                try
+                {
+                    File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "unhandled.log"),
+                        "UnhandledException:\n" + (e.ExceptionObject != null ? e.ExceptionObject.ToString() : "null"));
+                }
+                catch { }
+            };
+            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
+            {
+                try
+                {
+                    File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "unhandled.log"),
+                        "ThreadException:\n" + (e.Exception != null ? e.Exception.ToString() : "null"));
+                }
+                catch { }
+            };
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+
+            try
+            {
+                bool createdNew;
+                using (Mutex mutex = new Mutex(false, AppGuid, out createdNew))
+                {
+                    if (!createdNew)
+                    {
+                        MessageBox.Show(
+                            "Universal Peripheral Battery Monitor is already running in your taskbar system tray.\n\n" +
+                            "Look for the battery icons in the notification area near your clock.\n" +
+                            "(Click the '^' overflow arrow next to the clock if hidden).",
+                            "Already Running",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information);
+                        return;
+                    }
+
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    Application.Run(new UniversalTrayAppContext());
+                }
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "unhandled.log"),
+                        "Main catch:\n" + ex.ToString());
+                }
+                catch { }
+            }
+        }
+    }
+
+    public enum DeviceCategory
+    {
+        Keyboard,
+        Mouse,
+        Headset,
+        Controller,
+        Other
+    }
+
+    public class PeripheralDevice
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public DeviceCategory Category { get; set; }
+        public string ConnectionType { get; set; }
+        public int BatteryPercentage { get; set; }
+        public bool IsConnected { get; set; }
+        public bool IsSleeping { get; set; }
+        public bool IsCharging { get; set; }
+        public string HardwarePath { get; set; }
+        public string Protocol { get; set; }
+        public DateTime LastUpdated { get; set; }
+        public string StatusMessage { get; set; }
+
+        public PeripheralDevice()
+        {
+            BatteryPercentage = -1;
+            LastUpdated = DateTime.Now;
+            Category = DeviceCategory.Other;
+            ConnectionType = "Wireless";
+            StatusMessage = "Detecting...";
+        }
+
+        public string GetDisplayPercentage()
+        {
+            return BatteryPercentage >= 0 ? (BatteryPercentage + "%") : "--%";
+        }
+
+        public string GetCategoryLabel()
+        {
+            switch (Category)
+            {
+                case DeviceCategory.Keyboard: return "KB";
+                case DeviceCategory.Mouse: return "M";
+                case DeviceCategory.Headset: return "🎧";
+                case DeviceCategory.Controller: return "🎮";
+                default: return "DEV";
+            }
+        }
+    }
+
+    public class CustomDeviceConfig
+    {
+        public string Name { get; set; }
+        public ushort VendorId { get; set; }
+        public ushort ProductId { get; set; }
+        public ushort UsagePage { get; set; }
+        public byte QueryReportId { get; set; }
+        public byte[] QueryPayload { get; set; }
+        public byte ExpectedResponseReportId { get; set; }
+        public int BatteryByteOffset { get; set; }
+        public DeviceCategory Category { get; set; }
+
+        public CustomDeviceConfig()
+        {
+            Category = DeviceCategory.Mouse;
+            QueryReportId = 0xB3;
+            QueryPayload = new byte[] { 0x06 };
+            ExpectedResponseReportId = 0xB4;
+            BatteryByteOffset = 20;
+        }
+    }
+
+    public class AppSettings
+    {
+        public string PreferredKeyboardId { get; set; }
+        public string PreferredMouseId { get; set; }
+        public int PollIntervalSeconds { get; set; }
+        public int DisplayMode { get; set; } // 0 = Dual, 1 = KbOnly, 2 = MouseOnly, 3 = Combined, 4 = AllDevices
+        public int IconStyle { get; set; } // 0 = Badge+Bar, 1 = LargeNumber, 2 = GaugeOnly
+        public List<CustomDeviceConfig> CustomDevices { get; set; }
+
+        public AppSettings()
+        {
+            PreferredKeyboardId = "auto";
+            PreferredMouseId = "auto";
+            PollIntervalSeconds = 120;
+            DisplayMode = 0;
+            IconStyle = 0;
+            CustomDevices = new List<CustomDeviceConfig>();
+        }
+
+        public static string GetConfigPath()
+        {
+            string dir = Path.GetDirectoryName(Application.ExecutablePath);
+            return Path.Combine(dir, "config.json");
+        }
+
+        public static AppSettings Load()
+        {
+            AppSettings settings = new AppSettings();
+            string path = GetConfigPath();
+            if (File.Exists(path))
+            {
+                try
+                {
+                    string content = File.ReadAllText(path, Encoding.UTF8);
+                    // Simple, zero-dependency key-value parser for basic settings
+                    settings.PreferredKeyboardId = ExtractJsonString(content, "PreferredKeyboardId", "auto");
+                    settings.PreferredMouseId = ExtractJsonString(content, "PreferredMouseId", "auto");
+                    settings.PollIntervalSeconds = ExtractJsonInt(content, "PollIntervalSeconds", 120);
+                    settings.DisplayMode = ExtractJsonInt(content, "DisplayMode", 0);
+                    settings.IconStyle = ExtractJsonInt(content, "IconStyle", 0);
+                }
+                catch { }
+            }
+            else
+            {
+                settings.Save();
+            }
+            return settings;
+        }
+
+        public void Save()
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine("  \"PreferredKeyboardId\": \"" + EscapeJson(PreferredKeyboardId) + "\",");
+                sb.AppendLine("  \"PreferredMouseId\": \"" + EscapeJson(PreferredMouseId) + "\",");
+                sb.AppendLine("  \"PollIntervalSeconds\": " + PollIntervalSeconds + ",");
+                sb.AppendLine("  \"DisplayMode\": " + DisplayMode + ",");
+                sb.AppendLine("  \"IconStyle\": " + IconStyle);
+                sb.AppendLine("}");
+                File.WriteAllText(GetConfigPath(), sb.ToString(), Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        private static string EscapeJson(string s)
+        {
+            if (s == null) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        private static string ExtractJsonString(string json, string key, string def)
+        {
+            int idx = json.IndexOf("\"" + key + "\"", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return def;
+            int colon = json.IndexOf(':', idx);
+            if (colon < 0) return def;
+            int q1 = json.IndexOf('"', colon);
+            if (q1 < 0) return def;
+            int q2 = json.IndexOf('"', q1 + 1);
+            if (q2 < 0) return def;
+            return json.Substring(q1 + 1, q2 - q1 - 1);
+        }
+
+        private static int ExtractJsonInt(string json, string key, int def)
+        {
+            int idx = json.IndexOf("\"" + key + "\"", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return def;
+            int colon = json.IndexOf(':', idx);
+            if (colon < 0) return def;
+            int end = json.IndexOfAny(new char[] { ',', '}', '\r', '\n' }, colon + 1);
+            if (end < 0) end = json.Length;
+            string numStr = json.Substring(colon + 1, end - colon - 1).Trim();
+            int res;
+            if (int.TryParse(numStr, out res)) return res;
+            return def;
+        }
+    }
+
+    public class UniversalTrayAppContext : ApplicationContext
+    {
+        private NotifyIcon _kbIcon;
+        private NotifyIcon _mouseIcon;
+        private List<NotifyIcon> _extraIcons = new List<NotifyIcon>();
+
+        private ContextMenuStrip _contextMenu;
+        private Control _invoker;
+
+        private ToolStripMenuItem _menuHeader;
+        private ToolStripMenuItem _menuDevicesGroup;
+        private ToolStripMenuItem _menuRefresh;
+        private ToolStripMenuItem _menuInterval;
+        private ToolStripMenuItem _menuDisplayMode;
+        private ToolStripMenuItem _menuIconStyle;
+        private ToolStripMenuItem _menuAutoStart;
+        private ToolStripMenuItem _menuSetup;
+        private ToolStripMenuItem _menuDashboard;
+        private ToolStripMenuItem _menuExit;
+
+        private System.Windows.Forms.Timer _pollTimer;
+        private AppSettings _settings;
+
+        private List<PeripheralDevice> _detectedDevices = new List<PeripheralDevice>();
+        private PeripheralDevice _activeKeyboard = null;
+        private PeripheralDevice _activeMouse = null;
+
+        private Icon _currentKbIcon = null;
+        private Icon _currentMouseIcon = null;
+        private bool _firstPollDone = false;
+
+        private DashboardForm _dashboardForm = null;
+        private SetupDialog _setupDialog = null;
+
+        public UniversalTrayAppContext()
+        {
+            _settings = AppSettings.Load();
+            InitializeComponents();
+            PerformPollAsync();
+        }
+
+        private void InitializeComponents()
+        {
+            // Create hidden control for thread-safe cross-thread UI dispatching
+            _invoker = new Control();
+            IntPtr forceHandle = _invoker.Handle;
+
+            _contextMenu = new ContextMenuStrip();
+            _contextMenu.Font = new Font("Segoe UI", 9f);
+
+            _menuHeader = new ToolStripMenuItem("🔋 Universal Peripheral Battery Monitor");
+            _menuHeader.Enabled = false;
+            _menuHeader.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            _contextMenu.Items.Add(_menuHeader);
+            _contextMenu.Items.Add(new ToolStripSeparator());
+
+            // Devices list section
+            _menuDevicesGroup = new ToolStripMenuItem("Devices: Scanning...");
+            _menuDevicesGroup.Enabled = false;
+            _contextMenu.Items.Add(_menuDevicesGroup);
+            _contextMenu.Items.Add(new ToolStripSeparator());
+
+            _menuRefresh = new ToolStripMenuItem("🔄 Refresh Now", null, delegate { PerformPollAsync(); });
+            _contextMenu.Items.Add(_menuRefresh);
+
+            // Interval menu
+            _menuInterval = new ToolStripMenuItem("⏱ Polling Interval");
+            AddIntervalOption(_menuInterval, "30 seconds", 30);
+            AddIntervalOption(_menuInterval, "1 minute", 60);
+            AddIntervalOption(_menuInterval, "2 minutes", 120, _settings.PollIntervalSeconds == 120);
+            AddIntervalOption(_menuInterval, "5 minutes", 300, _settings.PollIntervalSeconds == 300);
+            AddIntervalOption(_menuInterval, "10 minutes", 600, _settings.PollIntervalSeconds == 600);
+            _contextMenu.Items.Add(_menuInterval);
+
+            // Display Mode menu
+            _menuDisplayMode = new ToolStripMenuItem("🎛 Tray Display Mode");
+            AddDisplayModeOption(_menuDisplayMode, "Dual Icons (Keyboard & Mouse)", 0, _settings.DisplayMode == 0);
+            AddDisplayModeOption(_menuDisplayMode, "Keyboard Icon Only", 1, _settings.DisplayMode == 1);
+            AddDisplayModeOption(_menuDisplayMode, "Mouse Icon Only", 2, _settings.DisplayMode == 2);
+            AddDisplayModeOption(_menuDisplayMode, "Combined Single Icon", 3, _settings.DisplayMode == 3);
+            AddDisplayModeOption(_menuDisplayMode, "All Detected Wireless Devices", 4, _settings.DisplayMode == 4);
+            _contextMenu.Items.Add(_menuDisplayMode);
+
+            // Icon Style menu
+            _menuIconStyle = new ToolStripMenuItem("🎨 Icon Visual Style");
+            AddStyleOption(_menuIconStyle, "Badge Number + Battery Bar", 0, _settings.IconStyle == 0);
+            AddStyleOption(_menuIconStyle, "Large Bold Number", 1, _settings.IconStyle == 1);
+            AddStyleOption(_menuIconStyle, "Battery Gauge Only", 2, _settings.IconStyle == 2);
+            _contextMenu.Items.Add(_menuIconStyle);
+
+            _contextMenu.Items.Add(new ToolStripSeparator());
+
+            // Setup / Configuration
+            _menuSetup = new ToolStripMenuItem("⚙ Device Setup & Configuration...", null, delegate { ShowSetupDialog(); });
+            _contextMenu.Items.Add(_menuSetup);
+
+            _menuDashboard = new ToolStripMenuItem("📊 Battery Dashboard...", null, delegate { ShowDashboard(); });
+            _contextMenu.Items.Add(_menuDashboard);
+
+            // Autostart
+            _menuAutoStart = new ToolStripMenuItem("🚀 Start with Windows", null, ToggleAutoStart);
+            _menuAutoStart.Checked = AutoStartManager.IsAutoStartEnabled();
+            _contextMenu.Items.Add(_menuAutoStart);
+
+            _contextMenu.Items.Add(new ToolStripSeparator());
+
+            _menuExit = new ToolStripMenuItem("❌ Exit", null, delegate { ExitApp(); });
+            _contextMenu.Items.Add(_menuExit);
+
+            // Immediate initial icons
+            _currentKbIcon = IconRenderer.CreateDeviceIcon("KB", -1, false, _settings.IconStyle);
+            _currentMouseIcon = IconRenderer.CreateDeviceIcon("M", -1, false, _settings.IconStyle);
+
+            _kbIcon = new NotifyIcon();
+            _kbIcon.Text = "Keyboard: Detecting...";
+            _kbIcon.Icon = _currentKbIcon;
+            _kbIcon.ContextMenuStrip = _contextMenu;
+            _kbIcon.Visible = true;
+            _kbIcon.DoubleClick += delegate { ShowDashboard(); };
+            _kbIcon.MouseClick += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left) ShowDashboard();
+            };
+
+            _mouseIcon = new NotifyIcon();
+            _mouseIcon.Text = "Mouse: Detecting...";
+            _mouseIcon.Icon = _currentMouseIcon;
+            _mouseIcon.ContextMenuStrip = _contextMenu;
+            _mouseIcon.Visible = true;
+            _mouseIcon.DoubleClick += delegate { ShowDashboard(); };
+            _mouseIcon.MouseClick += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left) ShowDashboard();
+            };
+
+            // Setup Timer
+            _pollTimer = new System.Windows.Forms.Timer();
+            _pollTimer.Interval = Math.Max(10000, _settings.PollIntervalSeconds * 1000);
+            _pollTimer.Tick += delegate { PerformPollAsync(); };
+            _pollTimer.Start();
+
+            UpdateTrayVisibility();
+        }
+
+        private void AddIntervalOption(ToolStripMenuItem parent, string text, int seconds, bool isDefault = false)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(text);
+            item.Checked = isDefault;
+            item.Click += delegate
+            {
+                foreach (ToolStripMenuItem sib in parent.DropDownItems) sib.Checked = false;
+                item.Checked = true;
+                _settings.PollIntervalSeconds = seconds;
+                _settings.Save();
+                _pollTimer.Interval = _settings.PollIntervalSeconds * 1000;
+            };
+            parent.DropDownItems.Add(item);
+        }
+
+        private void AddDisplayModeOption(ToolStripMenuItem parent, string text, int mode, bool isDefault = false)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(text);
+            item.Checked = isDefault;
+            item.Click += delegate
+            {
+                foreach (ToolStripMenuItem sib in parent.DropDownItems) sib.Checked = false;
+                item.Checked = true;
+                _settings.DisplayMode = mode;
+                _settings.Save();
+                UpdateTrayVisibility();
+                UpdateTrayIcons();
+            };
+            parent.DropDownItems.Add(item);
+        }
+
+        private void AddStyleOption(ToolStripMenuItem parent, string text, int styleIndex, bool isDefault = false)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(text);
+            item.Checked = isDefault;
+            item.Click += delegate
+            {
+                foreach (ToolStripMenuItem sib in parent.DropDownItems) sib.Checked = false;
+                item.Checked = true;
+                _settings.IconStyle = styleIndex;
+                _settings.Save();
+                UpdateTrayIcons();
+            };
+            parent.DropDownItems.Add(item);
+        }
+
+        private void UpdateTrayVisibility()
+        {
+            switch (_settings.DisplayMode)
+            {
+                case 0: // Dual (Keyboard & Mouse)
+                    _kbIcon.Visible = true;
+                    _mouseIcon.Visible = true;
+                    ClearExtraIcons();
+                    break;
+                case 1: // Keyboard Only
+                    _kbIcon.Visible = true;
+                    _mouseIcon.Visible = false;
+                    ClearExtraIcons();
+                    break;
+                case 2: // Mouse Only
+                    _kbIcon.Visible = false;
+                    _mouseIcon.Visible = true;
+                    ClearExtraIcons();
+                    break;
+                case 3: // Combined Single Icon
+                    _kbIcon.Visible = true;
+                    _mouseIcon.Visible = false;
+                    ClearExtraIcons();
+                    break;
+                case 4: // All Devices Mode
+                    _kbIcon.Visible = true;
+                    _mouseIcon.Visible = true;
+                    SyncExtraIcons();
+                    break;
+            }
+        }
+
+        private void ClearExtraIcons()
+        {
+            foreach (var ico in _extraIcons)
+            {
+                ico.Visible = false;
+                ico.Dispose();
+            }
+            _extraIcons.Clear();
+        }
+
+        private void SyncExtraIcons()
+        {
+            // For any additional wireless devices beyond primary keyboard and mouse
+            ClearExtraIcons();
+            foreach (var dev in _detectedDevices)
+            {
+                if (dev == _activeKeyboard || dev == _activeMouse) continue;
+                if (!dev.IsConnected && dev.BatteryPercentage < 0) continue;
+
+                NotifyIcon nIcon = new NotifyIcon();
+                nIcon.Icon = IconRenderer.CreateDeviceIcon(dev.GetCategoryLabel(), dev.BatteryPercentage, dev.IsConnected, _settings.IconStyle);
+                nIcon.Text = string.Format("{0}: {1}%\nConnection: {2}", dev.Name, dev.GetDisplayPercentage(), dev.ConnectionType);
+                nIcon.ContextMenuStrip = _contextMenu;
+                nIcon.Visible = true;
+                nIcon.DoubleClick += delegate { ShowDashboard(); };
+                _extraIcons.Add(nIcon);
+            }
+        }
+
+        private void ToggleAutoStart(object sender, EventArgs e)
+        {
+            bool newState = !AutoStartManager.IsAutoStartEnabled();
+            AutoStartManager.SetAutoStart(newState);
+            _menuAutoStart.Checked = newState;
+        }
+
+        private void PerformPollAsync()
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    List<PeripheralDevice> freshList = UniversalHardwareScanner.ScanAllPeripherals(_settings);
+
+                    // Preserve last known battery readings if device is asleep
+                    foreach (var fresh in freshList)
+                    {
+                        PeripheralDevice old = _detectedDevices.Find(d => d.Id == fresh.Id);
+                        if (old != null && !fresh.IsConnected && old.BatteryPercentage >= 0)
+                        {
+                            fresh.BatteryPercentage = old.BatteryPercentage;
+                            fresh.IsSleeping = true;
+                            fresh.StatusMessage = "Standby (Last: " + old.BatteryPercentage + "%)";
+                        }
+                    }
+
+                    _detectedDevices = freshList;
+
+                    // Determine active keyboard
+                    _activeKeyboard = null;
+                    if (!string.IsNullOrEmpty(_settings.PreferredKeyboardId) && _settings.PreferredKeyboardId != "auto")
+                    {
+                        _activeKeyboard = _detectedDevices.Find(d => d.Id == _settings.PreferredKeyboardId);
+                    }
+                    if (_activeKeyboard == null)
+                    {
+                        _activeKeyboard = _detectedDevices.Find(d => d.Category == DeviceCategory.Keyboard && d.IsConnected) ??
+                                          _detectedDevices.Find(d => d.Category == DeviceCategory.Keyboard);
+                    }
+
+                    // Determine active mouse
+                    _activeMouse = null;
+                    if (!string.IsNullOrEmpty(_settings.PreferredMouseId) && _settings.PreferredMouseId != "auto")
+                    {
+                        _activeMouse = _detectedDevices.Find(d => d.Id == _settings.PreferredMouseId);
+                    }
+                    if (_activeMouse == null)
+                    {
+                        _activeMouse = _detectedDevices.Find(d => d.Category == DeviceCategory.Mouse && d.IsConnected) ??
+                                       _detectedDevices.Find(d => d.Category == DeviceCategory.Mouse);
+                    }
+
+                    // Dispatch UI updates via _invoker
+                    if (_invoker != null && _invoker.IsHandleCreated)
+                    {
+                        try
+                        {
+                            _invoker.BeginInvoke((MethodInvoker)delegate
+                            {
+                                try
+                                {
+                                    UpdateTrayIcons();
+                                    UpdateContextMenuItems();
+
+                                    if (_dashboardForm != null && !_dashboardForm.IsDisposed)
+                                    {
+                                        _dashboardForm.UpdateDashboard(_detectedDevices, _activeKeyboard, _activeMouse);
+                                    }
+                                    if (_setupDialog != null && !_setupDialog.IsDisposed)
+                                    {
+                                        _setupDialog.UpdateDeviceList(_detectedDevices);
+                                    }
+
+                                    if (!_firstPollDone)
+                                    {
+                                        _firstPollDone = true;
+                                        string kbMsg = _activeKeyboard != null ? (_activeKeyboard.Name + ": " + _activeKeyboard.GetDisplayPercentage()) : "No Keyboard";
+                                        string mMsg = _activeMouse != null ? (_activeMouse.Name + ": " + _activeMouse.GetDisplayPercentage()) : "No Mouse";
+
+                                        _kbIcon.ShowBalloonTip(4000, "Universal Battery Monitor",
+                                            string.Format("{0}\n{1}\nActive in taskbar system tray.", kbMsg, mMsg),
+                                            ToolTipIcon.Info);
+                                    }
+                                }
+                                catch (Exception uiEx)
+                                {
+                                    try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), "UI update error: " + uiEx.ToString()); } catch { }
+                                }
+                            });
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception bgEx)
+                {
+                    try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), "Background poll error: " + bgEx.ToString()); } catch { }
+                }
+            });
+        }
+
+        private void UpdateContextMenuItems()
+        {
+            // Update devices listing in context menu
+            _contextMenu.SuspendLayout();
+
+            // Clear old dynamic items
+            int headerIdx = _contextMenu.Items.IndexOf(_menuHeader);
+            int refreshIdx = _contextMenu.Items.IndexOf(_menuRefresh);
+
+            for (int i = refreshIdx - 1; i > headerIdx; i--)
+            {
+                _contextMenu.Items.RemoveAt(i);
+            }
+
+            int insertIdx = headerIdx + 1;
+
+            if (_detectedDevices.Count == 0)
+            {
+                ToolStripMenuItem noneItem = new ToolStripMenuItem("No wireless devices detected");
+                noneItem.Enabled = false;
+                _contextMenu.Items.Insert(insertIdx++, noneItem);
+            }
+            else
+            {
+                foreach (var dev in _detectedDevices)
+                {
+                    string iconPrefix = dev.Category == DeviceCategory.Keyboard ? "⌨ " :
+                                        dev.Category == DeviceCategory.Mouse ? "🖱 " :
+                                        dev.Category == DeviceCategory.Headset ? "🎧 " : "🔋 ";
+
+                    string isPrimary = (dev == _activeKeyboard || dev == _activeMouse) ? " ★" : "";
+                    string text = string.Format("{0}{1}: {2} ({3}){4}",
+                        iconPrefix, dev.Name, dev.GetDisplayPercentage(), dev.ConnectionType, isPrimary);
+
+                    ToolStripMenuItem item = new ToolStripMenuItem(text, null, delegate { ShowDashboard(); });
+                    _contextMenu.Items.Insert(insertIdx++, item);
+                }
+            }
+
+            _contextMenu.Items.Insert(insertIdx, new ToolStripSeparator());
+            _contextMenu.ResumeLayout();
+        }
+
+        private void UpdateTrayIcons()
+        {
+            try
+            {
+                if (_settings.DisplayMode == 3) // Combined
+                {
+                    Icon oldIcon = _currentKbIcon;
+                    _currentKbIcon = IconRenderer.CreateCombinedIcon(_activeKeyboard, _activeMouse);
+                    _kbIcon.Icon = _currentKbIcon;
+                    _kbIcon.Text = string.Format("KB: {0} | Mouse: {1}",
+                        _activeKeyboard != null ? _activeKeyboard.GetDisplayPercentage() : "N/A",
+                        _activeMouse != null ? _activeMouse.GetDisplayPercentage() : "N/A");
+                    if (oldIcon != null) { DestroyIconHandle(oldIcon); }
+                }
+                else
+                {
+                    // Keyboard Icon
+                    Icon oldKb = _currentKbIcon;
+                    int kbPct = _activeKeyboard != null ? _activeKeyboard.BatteryPercentage : -1;
+                    bool kbConn = _activeKeyboard != null && _activeKeyboard.IsConnected;
+                    string kbName = _activeKeyboard != null ? _activeKeyboard.Name : "Keyboard";
+
+                    _currentKbIcon = IconRenderer.CreateDeviceIcon("KB", kbPct, kbConn, _settings.IconStyle);
+                    _kbIcon.Icon = _currentKbIcon;
+                    string kbTip = string.Format("{0}: {1}%\nStatus: {2}\nConnection: {3}",
+                        kbName,
+                        kbPct >= 0 ? kbPct.ToString() : "N/A",
+                        kbConn ? (_activeKeyboard.IsSleeping ? "Standby" : "Active") : "Offline",
+                        _activeKeyboard != null ? _activeKeyboard.ConnectionType : "None");
+                    if (kbTip.Length >= 127) kbTip = kbTip.Substring(0, 126);
+                    _kbIcon.Text = kbTip;
+                    if (oldKb != null) { DestroyIconHandle(oldKb); }
+
+                    // Mouse Icon
+                    Icon oldMouse = _currentMouseIcon;
+                    int mPct = _activeMouse != null ? _activeMouse.BatteryPercentage : -1;
+                    bool mConn = _activeMouse != null && _activeMouse.IsConnected;
+                    string mName = _activeMouse != null ? _activeMouse.Name : "Mouse";
+
+                    _currentMouseIcon = IconRenderer.CreateDeviceIcon("M", mPct, mConn, _settings.IconStyle);
+                    _mouseIcon.Icon = _currentMouseIcon;
+                    string mTip = string.Format("{0}: {1}%\nStatus: {2}\nConnection: {3}",
+                        mName,
+                        mPct >= 0 ? mPct.ToString() : "N/A",
+                        mConn ? (_activeMouse.IsSleeping ? "Standby" : "Active") : "Offline",
+                        _activeMouse != null ? _activeMouse.ConnectionType : "None");
+                    if (mTip.Length >= 127) mTip = mTip.Substring(0, 126);
+                    _mouseIcon.Text = mTip;
+                    if (oldMouse != null) { DestroyIconHandle(oldMouse); }
+                }
+
+                if (_settings.DisplayMode == 4)
+                {
+                    SyncExtraIcons();
+                }
+            }
+            catch { }
+        }
+
+        private void DestroyIconHandle(Icon ico)
+        {
+            try
+            {
+                if (ico != null)
+                {
+                    IconRenderer.DestroyNativeIcon(ico.Handle);
+                    ico.Dispose();
+                }
+            }
+            catch { }
+        }
+
+        private void ShowDashboard()
+        {
+            if (_dashboardForm == null || _dashboardForm.IsDisposed)
+            {
+                _dashboardForm = new DashboardForm(_detectedDevices, _activeKeyboard, _activeMouse,
+                    delegate { PerformPollAsync(); },
+                    delegate { ShowSetupDialog(); });
+                _dashboardForm.Show();
+            }
+            else
+            {
+                _dashboardForm.BringToFront();
+                _dashboardForm.WindowState = FormWindowState.Normal;
+            }
+        }
+
+        private void ShowSetupDialog()
+        {
+            if (_setupDialog == null || _setupDialog.IsDisposed)
+            {
+                _setupDialog = new SetupDialog(_settings, _detectedDevices, delegate
+                {
+                    _settings.Save();
+                    _pollTimer.Interval = Math.Max(10000, _settings.PollIntervalSeconds * 1000);
+                    UpdateTrayVisibility();
+                    PerformPollAsync();
+                });
+                _setupDialog.Show();
+            }
+            else
+            {
+                _setupDialog.BringToFront();
+                _setupDialog.WindowState = FormWindowState.Normal;
+            }
+        }
+
+        private void ExitApp()
+        {
+            if (_pollTimer != null)
+            {
+                _pollTimer.Stop();
+                _pollTimer.Dispose();
+            }
+
+            if (_kbIcon != null)
+            {
+                _kbIcon.Visible = false;
+                _kbIcon.Dispose();
+            }
+            if (_mouseIcon != null)
+            {
+                _mouseIcon.Visible = false;
+                _mouseIcon.Dispose();
+            }
+            ClearExtraIcons();
+
+            DestroyIconHandle(_currentKbIcon);
+            DestroyIconHandle(_currentMouseIcon);
+
+            if (_invoker != null)
+            {
+                _invoker.Dispose();
+                _invoker = null;
+            }
+
+            Application.Exit();
+        }
+    }
+
+    public static class IconRenderer
+    {
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool DestroyIcon(IntPtr hIcon);
+
+        public static void DestroyNativeIcon(IntPtr hIcon)
+        {
+            try { DestroyIcon(hIcon); } catch { }
+        }
+
+        public static Icon CreateDeviceIcon(string label, int pct, bool connected, int style)
+        {
+            using (Bitmap bmp = new Bitmap(32, 32))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.Clear(Color.Transparent);
+
+                    Color statusColor = Color.FromArgb(34, 197, 94); // Green
+                    if (!connected) statusColor = Color.FromArgb(140, 140, 140);
+                    else if (pct < 20) statusColor = Color.FromArgb(239, 68, 68); // Red
+                    else if (pct < 50) statusColor = Color.FromArgb(245, 158, 11); // Amber
+
+                    if (style == 1) // Large Number Mode
+                    {
+                        using (Font fL = new Font("Segoe UI", 8f, FontStyle.Bold))
+                        using (Brush bL = new SolidBrush(Color.White))
+                        {
+                            g.DrawString(label, fL, bL, 1, 0);
+                        }
+
+                        string num = (connected && pct >= 0) ? pct.ToString() : "--";
+                        using (Font fN = new Font("Arial Black", 11f, FontStyle.Bold))
+                        using (Brush bN = new SolidBrush(statusColor))
+                        using (Brush bShadow = new SolidBrush(Color.Black))
+                        {
+                            g.DrawString(num, fN, bShadow, 1, 12);
+                            g.DrawString(num, fN, bN, 0, 11);
+                        }
+                    }
+                    else if (style == 2) // Battery Gauge Only
+                    {
+                        using (Font fL = new Font("Segoe UI", 9f, FontStyle.Bold))
+                        using (Brush bL = new SolidBrush(Color.White))
+                        {
+                            g.DrawString(label, fL, bL, 2, 0);
+                        }
+
+                        Rectangle bRect = new Rectangle(2, 16, 25, 14);
+                        Rectangle nRect = new Rectangle(27, 20, 3, 6);
+
+                        using (Brush bBack = new SolidBrush(Color.FromArgb(50, 50, 50)))
+                        {
+                            g.FillRectangle(bBack, bRect);
+                        }
+                        if (connected && pct > 0)
+                        {
+                            int fill = Math.Max(2, (int)((bRect.Width - 2) * (pct / 100.0)));
+                            using (Brush bFill = new SolidBrush(statusColor))
+                            {
+                                g.FillRectangle(bFill, bRect.X + 1, bRect.Y + 1, fill, bRect.Height - 2);
+                            }
+                        }
+                        using (Pen p = new Pen(Color.White, 1.5f))
+                        {
+                            g.DrawRectangle(p, bRect);
+                            g.DrawRectangle(p, nRect);
+                        }
+                    }
+                    else // Default: Badge Number + Battery Bar
+                    {
+                        using (Font fLabel = new Font("Segoe UI", 8.5f, FontStyle.Bold))
+                        using (Brush bL = new SolidBrush(Color.FromArgb(230, 230, 230)))
+                        using (Brush bShadow = new SolidBrush(Color.Black))
+                        {
+                            g.DrawString(label, fLabel, bShadow, 2, 1);
+                            g.DrawString(label, fLabel, bL, 1, 0);
+                        }
+
+                        string num = (connected && pct >= 0) ? pct.ToString() : "--";
+                        using (Font fNum = new Font("Arial", 8f, FontStyle.Bold))
+                        using (Brush bNum = new SolidBrush(Color.White))
+                        using (Brush bShadow = new SolidBrush(Color.Black))
+                        {
+                            SizeF sz = g.MeasureString(num, fNum);
+                            float nx = 31 - sz.Width;
+                            g.DrawString(num, fNum, bShadow, nx + 1, 1);
+                            g.DrawString(num, fNum, bNum, nx, 0);
+                        }
+
+                        Rectangle battRect = new Rectangle(1, 17, 26, 13);
+                        Rectangle nubRect = new Rectangle(27, 21, 3, 5);
+
+                        using (Brush bBack = new SolidBrush(Color.FromArgb(35, 35, 35)))
+                        {
+                            g.FillRectangle(bBack, battRect);
+                        }
+
+                        if (connected && pct > 0)
+                        {
+                            int fillW = Math.Max(2, (int)((battRect.Width - 2) * (pct / 100.0)));
+                            using (Brush bFill = new SolidBrush(statusColor))
+                            {
+                                g.FillRectangle(bFill, battRect.X + 1, battRect.Y + 1, fillW, battRect.Height - 2);
+                            }
+                        }
+
+                        using (Pen pBorder = new Pen(Color.FromArgb(220, 220, 220), 1.2f))
+                        {
+                            g.DrawRectangle(pBorder, battRect);
+                            g.DrawRectangle(pBorder, nubRect);
+                        }
+                    }
+                }
+
+                IntPtr hIcon = bmp.GetHicon();
+                Icon ico = (Icon)Icon.FromHandle(hIcon).Clone();
+                DestroyNativeIcon(hIcon);
+                return ico;
+            }
+        }
+
+        public static Icon CreateCombinedIcon(PeripheralDevice kb, PeripheralDevice mouse)
+        {
+            using (Bitmap bmp = new Bitmap(32, 32))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+                    g.Clear(Color.Transparent);
+
+                    int kbPct = kb != null ? kb.BatteryPercentage : -1;
+                    bool kbConn = kb != null && kb.IsConnected;
+                    DrawMiniBar(g, "K", kbPct, kbConn, 0, 0);
+
+                    int mPct = mouse != null ? mouse.BatteryPercentage : -1;
+                    bool mConn = mouse != null && mouse.IsConnected;
+                    DrawMiniBar(g, "M", mPct, mConn, 0, 16);
+                }
+
+                IntPtr hIcon = bmp.GetHicon();
+                Icon ico = (Icon)Icon.FromHandle(hIcon).Clone();
+                DestroyNativeIcon(hIcon);
+                return ico;
+            }
+        }
+
+        private static void DrawMiniBar(Graphics g, string label, int pct, bool connected, int x, int y)
+        {
+            Color c = Color.FromArgb(34, 197, 94);
+            if (!connected) c = Color.FromArgb(140, 140, 140);
+            else if (pct < 20) c = Color.FromArgb(239, 68, 68);
+            else if (pct < 50) c = Color.FromArgb(245, 158, 11);
+
+            using (Font f = new Font("Segoe UI", 7.5f, FontStyle.Bold))
+            using (Brush bText = new SolidBrush(Color.White))
+            {
+                g.DrawString(label, f, bText, x, y);
+            }
+
+            Rectangle bRect = new Rectangle(x + 12, y + 2, 16, 9);
+            using (Brush bBack = new SolidBrush(Color.FromArgb(40, 40, 40)))
+            {
+                g.FillRectangle(bBack, bRect);
+            }
+            if (connected && pct > 0)
+            {
+                int w = Math.Max(1, (int)((bRect.Width - 2) * (pct / 100.0)));
+                using (Brush bFill = new SolidBrush(c))
+                {
+                    g.FillRectangle(bFill, bRect.X + 1, bRect.Y + 1, w, bRect.Height - 2);
+                }
+            }
+            using (Pen p = new Pen(Color.White, 1f))
+            {
+                g.DrawRectangle(p, bRect);
+            }
+        }
+    }
+
+    public static class UniversalHardwareScanner
+    {
+        private static readonly Guid GUID_DEVINTERFACE_HID = new Guid("4D1E55B2-F16F-11CF-88CB-001111000030");
+        private static readonly DEVPROPKEY DEVPKEY_Device_BatteryPercentage = new DEVPROPKEY
+        {
+            fmtid = new Guid("104EA319-6EE2-4701-BD47-8DDBF425BBE5"),
+            pid = 2
+        };
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct DEVPROPKEY
+        {
+            public Guid fmtid;
+            public uint pid;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SP_DEVINFO_DATA
+        {
+            public int cbSize;
+            public Guid classGuid;
+            public uint devInst;
+            public IntPtr reserved;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SP_DEVICE_INTERFACE_DATA
+        {
+            public int cbSize;
+            public Guid interfaceClassGuid;
+            public int flags;
+            public IntPtr reserved;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct HIDP_CAPS
+        {
+            public ushort Usage;
+            public ushort UsagePage;
+            public ushort InputReportByteLength;
+            public ushort OutputReportByteLength;
+            public ushort FeatureReportByteLength;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 17)]
+            public ushort[] Reserved;
+            public ushort NumberLinkCollectionNodes;
+            public ushort NumberInputButtonCaps;
+            public ushort NumberInputValueCaps;
+            public ushort NumberInputDataIndices;
+            public ushort NumberOutputButtonCaps;
+            public ushort NumberOutputValueCaps;
+            public ushort NumberOutputDataIndices;
+            public ushort NumberFeatureButtonCaps;
+            public ushort NumberFeatureValueCaps;
+            public ushort NumberFeatureDataIndices;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct OVERLAPPED
+        {
+            public IntPtr Internal;
+            public IntPtr InternalHigh;
+            public uint Offset;
+            public uint OffsetHigh;
+            public IntPtr hEvent;
+        }
+
+        [DllImport("setupapi.dll", SetLastError = true)]
+        static extern IntPtr SetupDiGetClassDevs(IntPtr ClassGuid, string Enumerator, IntPtr hwndParent, uint Flags);
+
+        [DllImport("setupapi.dll", SetLastError = true)]
+        static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, IntPtr Enumerator, IntPtr hwndParent, uint Flags);
+
+        [DllImport("setupapi.dll", SetLastError = true)]
+        static extern bool SetupDiEnumDeviceInfo(IntPtr DeviceInfoSet, uint MemberIndex, ref SP_DEVINFO_DATA DeviceInfoData);
+
+        [DllImport("setupapi.dll", SetLastError = true)]
+        static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
+
+        [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, ref uint RequiredSize, IntPtr DeviceInfoData);
+
+        [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern bool SetupDiGetDevicePropertyW(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref DEVPROPKEY propertyKey, out uint propertyType, byte[] propertyBuffer, uint propertyBufferSize, out uint requiredSize, uint flags);
+
+        [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint Property, out uint PropertyRegDataType, StringBuilder PropertyBuffer, uint PropertyBufferSize, out uint RequiredSize);
+
+        [DllImport("setupapi.dll", SetLastError = true)]
+        static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        static extern bool HidD_GetPreparsedData(IntPtr HidDeviceObject, out IntPtr PreparsedData);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        static extern int HidP_GetCaps(IntPtr PreparsedData, out HIDP_CAPS Capabilities);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        static extern bool HidD_FreePreparsedData(IntPtr PreparsedData);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        static extern bool HidD_SetOutputReport(IntPtr HidDeviceObject, byte[] ReportBuffer, uint ReportBufferLength);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        static extern bool HidD_GetFeature(IntPtr HidDeviceObject, byte[] ReportBuffer, uint ReportBufferLength);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, ref OVERLAPPED lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, ref OVERLAPPED lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetOverlappedResult(IntPtr hFile, ref OVERLAPPED lpOverlapped, out uint lpNumberOfBytesTransferred, bool bWait);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string lpName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CancelIo(IntPtr hFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr hObject);
+
+        public static List<PeripheralDevice> ScanAllPeripherals(AppSettings settings)
+        {
+            List<PeripheralDevice> list = new List<PeripheralDevice>();
+            Dictionary<string, bool> seen = new Dictionary<string, bool>();
+
+            // 1. Scan PnP Devices (Bluetooth LE, Windows native battery properties)
+            ScanPnpDevices(list, seen);
+
+            // 2. Scan Keychron proprietary dongles (VID 0x3434)
+            ScanKeychronDevices(list, seen);
+
+            // 3. Scan Logitech HID++ dongles (VID 0x046D)
+            ScanLogitechDevices(list, seen);
+
+            // 4. Scan Razer wireless dongles (VID 0x1532)
+            ScanRazerDevices(list, seen);
+
+            // 5. Scan Generic HID standard battery page (UsagePage 0x85)
+            ScanGenericHidBatteryDevices(list, seen);
+
+            // 6. Scan custom configured devices
+            if (settings != null && settings.CustomDevices != null)
+            {
+                ScanCustomDevices(list, seen, settings.CustomDevices);
+            }
+
+            return list;
+        }
+
+        private static void ScanPnpDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        {
+            IntPtr hDevInfo = SetupDiGetClassDevs(IntPtr.Zero, null, IntPtr.Zero, 0x14); // DIGCF_ALLCLASSES | DIGCF_PRESENT
+            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+
+            try
+            {
+                SP_DEVINFO_DATA devData = new SP_DEVINFO_DATA();
+                devData.cbSize = Marshal.SizeOf(devData);
+                uint index = 0;
+
+                while (SetupDiEnumDeviceInfo(hDevInfo, index++, ref devData))
+                {
+                    StringBuilder sbName = new StringBuilder(512);
+                    uint regType, reqSize;
+                    if (!SetupDiGetDeviceRegistryPropertyW(hDevInfo, ref devData, 12, out regType, sbName, (uint)sbName.Capacity, out reqSize)) // SPDRP_FRIENDLYNAME
+                    {
+                        SetupDiGetDeviceRegistryPropertyW(hDevInfo, ref devData, 0, out regType, sbName, (uint)sbName.Capacity, out reqSize); // SPDRP_DEVICEDESC
+                    }
+                    string name = sbName.ToString();
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    StringBuilder sbClass = new StringBuilder(256);
+                    SetupDiGetDeviceRegistryPropertyW(hDevInfo, ref devData, 7, out regType, sbClass, (uint)sbClass.Capacity, out reqSize); // SPDRP_CLASS
+                    string className = sbClass.ToString();
+
+                    uint propType, propReqSize;
+                    byte[] propBuf = new byte[32];
+                    DEVPROPKEY battKey = DEVPKEY_Device_BatteryPercentage;
+
+                    if (SetupDiGetDevicePropertyW(hDevInfo, ref devData, ref battKey, out propType, propBuf, (uint)propBuf.Length, out propReqSize, 0))
+                    {
+                        int pct = propBuf[0];
+                        if (pct >= 0 && pct <= 100)
+                        {
+                            string id = "pnp:" + name.ToLower().Trim();
+                            if (!seen.ContainsKey(id))
+                            {
+                                seen[id] = true;
+                                PeripheralDevice dev = new PeripheralDevice();
+                                dev.Id = id;
+                                dev.Name = name;
+                                dev.BatteryPercentage = pct;
+                                dev.IsConnected = true;
+                                dev.ConnectionType = "Bluetooth LE / PnP";
+                                dev.Protocol = "Windows DEVPKEY";
+                                dev.StatusMessage = "Active - " + pct + "%";
+                                dev.Category = CategorizeDevice(name, "", className, 0, 0);
+                                list.Add(dev);
+                            }
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(hDevInfo);
+            }
+        }
+
+        private static void ScanKeychronDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        {
+            Guid hidGuid = GUID_DEVINTERFACE_HID;
+            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
+            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
+                ifData.cbSize = Marshal.SizeOf(ifData);
+                uint index = 0;
+
+                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                {
+                    uint reqSize = 0;
+                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
+                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+
+                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    {
+                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+
+                        if (path.IndexOf("vid_3434", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000 /* FILE_FLAG_OVERLAPPED */, IntPtr.Zero);
+                            if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
+                            {
+                                try
+                                {
+                                    IntPtr pPre = IntPtr.Zero;
+                                    if (HidD_GetPreparsedData(hDev, out pPre))
+                                    {
+                                        HIDP_CAPS caps;
+                                        HidP_GetCaps(pPre, out caps);
+                                        HidD_FreePreparsedData(pPre);
+
+                                        if (caps.UsagePage == 0xFFC1 && caps.OutputReportByteLength == 64 && caps.InputReportByteLength == 64)
+                                        {
+                                            IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
+                                            IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
+
+                                            try
+                                            {
+                                                OVERLAPPED ovR = new OVERLAPPED();
+                                                ovR.hEvent = hReadEv;
+                                                byte[] inReport = new byte[64];
+                                                uint readBytes = 0;
+
+                                                ReadFile(hDev, inReport, 64, out readBytes, ref ovR);
+
+                                                byte[] outReport = new byte[64];
+                                                outReport[0] = 0xB3;
+                                                outReport[1] = 0x06;
+
+                                                OVERLAPPED ovW = new OVERLAPPED();
+                                                ovW.hEvent = hWriteEv;
+                                                uint written = 0;
+                                                WriteFile(hDev, outReport, 64, out written, ref ovW);
+                                                WaitForSingleObject(hWriteEv, 500);
+
+                                                HidD_SetOutputReport(hDev, outReport, 64);
+
+                                                uint waitRes = WaitForSingleObject(hReadEv, 2500);
+                                                string devId = "keychron:dongle";
+                                                if (!seen.ContainsKey(devId))
+                                                {
+                                                    seen[devId] = true;
+                                                    PeripheralDevice dev = new PeripheralDevice();
+                                                    dev.Id = devId;
+                                                    dev.Name = "Keychron M6 Wireless Mouse";
+                                                    dev.Category = DeviceCategory.Mouse;
+                                                    dev.ConnectionType = "2.4GHz Dongle (Keychron Link)";
+                                                    dev.HardwarePath = path;
+                                                    dev.Protocol = "Keychron 0xFFC1 (0xB3/0xB4)";
+
+                                                    if (waitRes == 0)
+                                                    {
+                                                        GetOverlappedResult(hDev, ref ovR, out readBytes, false);
+                                                        if (readBytes >= 21 && inReport[0] == 0xB4)
+                                                        {
+                                                            int pct = inReport[20];
+                                                            if (pct >= 0 && pct <= 100)
+                                                            {
+                                                                dev.BatteryPercentage = pct;
+                                                                dev.IsConnected = true;
+                                                                dev.StatusMessage = "Active - " + pct + "%";
+                                                            }
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        dev.BatteryPercentage = -1;
+                                                        dev.IsConnected = false;
+                                                        dev.IsSleeping = true;
+                                                        dev.StatusMessage = "Standby (Move mouse to wake)";
+                                                    }
+                                                    list.Add(dev);
+                                                }
+                                            }
+                                            finally
+                                            {
+                                                CancelIo(hDev);
+                                                CloseHandle(hReadEv);
+                                                CloseHandle(hWriteEv);
+                                            }
+                                        }
+                                    }
+                                }
+                                finally
+                                {
+                                    CloseHandle(hDev);
+                                }
+                            }
+                        }
+                    }
+                    Marshal.FreeHGlobal(pDetail);
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(hDevInfo);
+            }
+        }
+
+        private static void ScanLogitechDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        {
+            // Logitech HID++ auto-detection (Unifying, Lightspeed, Bolt receivers)
+            Guid hidGuid = GUID_DEVINTERFACE_HID;
+            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
+            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
+                ifData.cbSize = Marshal.SizeOf(ifData);
+                uint index = 0;
+
+                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                {
+                    uint reqSize = 0;
+                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
+                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+
+                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    {
+                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+
+                        if (path.IndexOf("vid_046d", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
+                            if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
+                            {
+                                try
+                                {
+                                    IntPtr pPre = IntPtr.Zero;
+                                    if (HidD_GetPreparsedData(hDev, out pPre))
+                                    {
+                                        HIDP_CAPS caps;
+                                        HidP_GetCaps(pPre, out caps);
+                                        HidD_FreePreparsedData(pPre);
+
+                                        // Logitech HID++ communication typically uses short (7 bytes) or long (20 bytes) reports
+                                        if (caps.OutputReportByteLength >= 7 && caps.InputReportByteLength >= 7)
+                                        {
+                                            // Query device index 1 through 4 on the receiver
+                                            for (byte devIndex = 1; devIndex <= 4; devIndex++)
+                                            {
+                                                IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
+                                                IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
+
+                                                try
+                                                {
+                                                    OVERLAPPED ovR = new OVERLAPPED();
+                                                    ovR.hEvent = hReadEv;
+                                                    byte[] inReport = new byte[caps.InputReportByteLength];
+                                                    uint readBytes = 0;
+
+                                                    ReadFile(hDev, inReport, (uint)inReport.Length, out readBytes, ref ovR);
+
+                                                    // Send HID++ 1.0 Battery Register Read (0x07): 0x10 <devIndex> 0x81 0x07 0x00 0x00 0x00
+                                                    byte[] outReport = new byte[caps.OutputReportByteLength];
+                                                    outReport[0] = 0x10;
+                                                    outReport[1] = devIndex;
+                                                    outReport[2] = 0x81;
+                                                    outReport[3] = 0x07;
+
+                                                    OVERLAPPED ovW = new OVERLAPPED();
+                                                    ovW.hEvent = hWriteEv;
+                                                    uint written = 0;
+                                                    WriteFile(hDev, outReport, (uint)outReport.Length, out written, ref ovW);
+                                                    WaitForSingleObject(hWriteEv, 200);
+
+                                                    uint waitRes = WaitForSingleObject(hReadEv, 300);
+                                                    if (waitRes == 0)
+                                                    {
+                                                        GetOverlappedResult(hDev, ref ovR, out readBytes, false);
+                                                        if (readBytes >= 7 && inReport[0] == 0x10 && inReport[1] == devIndex)
+                                                        {
+                                                            int rawLevel = inReport[4];
+                                                            int pct = -1;
+                                                            if (rawLevel <= 100) pct = rawLevel;
+                                                            else if (rawLevel == 0x10) pct = 100;
+                                                            else if (rawLevel == 0x20) pct = 50;
+                                                            else if (rawLevel == 0x40) pct = 20;
+                                                            else if (rawLevel == 0x80) pct = 5;
+
+                                                            if (pct >= 0)
+                                                            {
+                                                                string devId = "logitech:" + devIndex;
+                                                                if (!seen.ContainsKey(devId))
+                                                                {
+                                                                    seen[devId] = true;
+                                                                    PeripheralDevice dev = new PeripheralDevice();
+                                                                    dev.Id = devId;
+                                                                    dev.Name = string.Format("Logitech Device #{0}", devIndex);
+                                                                    dev.BatteryPercentage = pct;
+                                                                    dev.IsConnected = true;
+                                                                    dev.ConnectionType = "Logitech Unifying/Lightspeed";
+                                                                    dev.Protocol = "Logitech HID++";
+                                                                    dev.Category = devIndex == 1 ? DeviceCategory.Mouse : DeviceCategory.Keyboard;
+                                                                    dev.StatusMessage = "Active - " + pct + "%";
+                                                                    list.Add(dev);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        CancelIo(hDev);
+                                                    }
+                                                }
+                                                finally
+                                                {
+                                                    CancelIo(hDev);
+                                                    CloseHandle(hReadEv);
+                                                    CloseHandle(hWriteEv);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                finally
+                                {
+                                    CloseHandle(hDev);
+                                }
+                            }
+                        }
+                    }
+                    Marshal.FreeHGlobal(pDetail);
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(hDevInfo);
+            }
+        }
+
+        private static void ScanRazerDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        {
+            // Razer HyperSpeed 2.4GHz Dongles (VID 0x1532)
+            Guid hidGuid = GUID_DEVINTERFACE_HID;
+            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
+            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
+                ifData.cbSize = Marshal.SizeOf(ifData);
+                uint index = 0;
+
+                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                {
+                    uint reqSize = 0;
+                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
+                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+
+                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    {
+                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+
+                        if (path.IndexOf("vid_1532", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
+                            if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
+                            {
+                                try
+                                {
+                                    IntPtr pPre = IntPtr.Zero;
+                                    if (HidD_GetPreparsedData(hDev, out pPre))
+                                    {
+                                        HIDP_CAPS caps;
+                                        HidP_GetCaps(pPre, out caps);
+                                        HidD_FreePreparsedData(pPre);
+
+                                        // Razer status report length is typically 90 bytes
+                                        if (caps.OutputReportByteLength >= 90 && caps.InputReportByteLength >= 90)
+                                        {
+                                            IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
+                                            IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
+
+                                            try
+                                            {
+                                                OVERLAPPED ovR = new OVERLAPPED();
+                                                ovR.hEvent = hReadEv;
+                                                byte[] inReport = new byte[caps.InputReportByteLength];
+                                                uint readBytes = 0;
+
+                                                ReadFile(hDev, inReport, (uint)inReport.Length, out readBytes, ref ovR);
+
+                                                byte[] outReport = new byte[caps.OutputReportByteLength];
+                                                outReport[0] = 0x00; // Report ID
+                                                outReport[1] = 0x00; // Status
+                                                outReport[2] = 0x00; // Transaction ID
+                                                outReport[5] = 0x02; // Command Class: Device
+                                                outReport[6] = 0x07; // Command ID: Battery
+
+                                                OVERLAPPED ovW = new OVERLAPPED();
+                                                ovW.hEvent = hWriteEv;
+                                                uint written = 0;
+                                                WriteFile(hDev, outReport, (uint)outReport.Length, out written, ref ovW);
+                                                WaitForSingleObject(hWriteEv, 200);
+
+                                                uint waitRes = WaitForSingleObject(hReadEv, 500);
+                                                if (waitRes == 0)
+                                                {
+                                                    GetOverlappedResult(hDev, ref ovR, out readBytes, false);
+                                                    if (readBytes >= 10)
+                                                    {
+                                                        int rawVal = inReport[9];
+                                                        int pct = (int)((rawVal / 255.0) * 100);
+                                                        if (pct >= 0 && pct <= 100)
+                                                        {
+                                                            string devId = "razer:wireless";
+                                                            if (!seen.ContainsKey(devId))
+                                                            {
+                                                                seen[devId] = true;
+                                                                PeripheralDevice dev = new PeripheralDevice();
+                                                                dev.Id = devId;
+                                                                dev.Name = "Razer Wireless Mouse/Keyboard";
+                                                                dev.BatteryPercentage = pct;
+                                                                dev.IsConnected = true;
+                                                                dev.ConnectionType = "Razer HyperSpeed 2.4G";
+                                                                dev.Protocol = "Razer HID";
+                                                                dev.Category = DeviceCategory.Mouse;
+                                                                dev.StatusMessage = "Active - " + pct + "%";
+                                                                list.Add(dev);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    CancelIo(hDev);
+                                                }
+                                            }
+                                            finally
+                                            {
+                                                CloseHandle(hReadEv);
+                                                CloseHandle(hWriteEv);
+                                            }
+                                        }
+                                    }
+                                }
+                                finally
+                                {
+                                    CloseHandle(hDev);
+                                }
+                            }
+                        }
+                    }
+                    Marshal.FreeHGlobal(pDetail);
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(hDevInfo);
+            }
+        }
+
+        private static void ScanGenericHidBatteryDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        {
+            // USB-IF Standard HID Battery System (Usage Page 0x85)
+            Guid hidGuid = GUID_DEVINTERFACE_HID;
+            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
+            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
+                ifData.cbSize = Marshal.SizeOf(ifData);
+                uint index = 0;
+
+                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                {
+                    uint reqSize = 0;
+                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
+                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+
+                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    {
+                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+
+                        IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+                        if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
+                        {
+                            try
+                            {
+                                IntPtr pPre = IntPtr.Zero;
+                                if (HidD_GetPreparsedData(hDev, out pPre))
+                                {
+                                    HIDP_CAPS caps;
+                                    HidP_GetCaps(pPre, out caps);
+                                    HidD_FreePreparsedData(pPre);
+
+                                    // Check if collection uses Battery System (0x85) or Power Device (0x84)
+                                    if (caps.UsagePage == 0x85 || caps.UsagePage == 0x84)
+                                    {
+                                        if (caps.FeatureReportByteLength > 0)
+                                        {
+                                            byte[] featBuf = new byte[caps.FeatureReportByteLength];
+                                            if (HidD_GetFeature(hDev, featBuf, (uint)featBuf.Length))
+                                            {
+                                                // Standard battery capacity is usually at byte index 1 or 2
+                                                int pct = featBuf.Length > 1 ? featBuf[1] : -1;
+                                                if (pct >= 0 && pct <= 100)
+                                                {
+                                                    string devId = "hid_bat:" + path.ToLower();
+                                                    if (!seen.ContainsKey(devId))
+                                                    {
+                                                        seen[devId] = true;
+                                                        PeripheralDevice dev = new PeripheralDevice();
+                                                        dev.Id = devId;
+                                                        dev.Name = "Standard HID Wireless Device";
+                                                        dev.BatteryPercentage = pct;
+                                                        dev.IsConnected = true;
+                                                        dev.ConnectionType = "USB HID Battery System (2.4G)";
+                                                        dev.Protocol = "UsagePage 0x85";
+                                                        dev.Category = CategorizeDevice("", path, "", caps.UsagePage, caps.Usage);
+                                                        dev.StatusMessage = "Active - " + pct + "%";
+                                                        list.Add(dev);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                CloseHandle(hDev);
+                            }
+                        }
+                    }
+                    Marshal.FreeHGlobal(pDetail);
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(hDevInfo);
+            }
+        }
+
+        private static void ScanCustomDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<CustomDeviceConfig> customConfigs)
+        {
+            if (customConfigs == null || customConfigs.Count == 0) return;
+
+            Guid hidGuid = GUID_DEVINTERFACE_HID;
+            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
+            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
+                ifData.cbSize = Marshal.SizeOf(ifData);
+                uint index = 0;
+
+                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                {
+                    uint reqSize = 0;
+                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
+                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+
+                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    {
+                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+
+                        foreach (var cfg in customConfigs)
+                        {
+                            string vidStr = string.Format("vid_{0:X4}", cfg.VendorId);
+                            string pidStr = string.Format("pid_{0:X4}", cfg.ProductId);
+
+                            if (path.IndexOf(vidStr, StringComparison.OrdinalIgnoreCase) >= 0 &&
+                                path.IndexOf(pidStr, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
+                                if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
+                                {
+                                    try
+                                    {
+                                        IntPtr pPre = IntPtr.Zero;
+                                        if (HidD_GetPreparsedData(hDev, out pPre))
+                                        {
+                                            HIDP_CAPS caps;
+                                            HidP_GetCaps(pPre, out caps);
+                                            HidD_FreePreparsedData(pPre);
+
+                                            if (cfg.UsagePage == 0 || caps.UsagePage == cfg.UsagePage)
+                                            {
+                                                IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
+                                                IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
+
+                                                try
+                                                {
+                                                    OVERLAPPED ovR = new OVERLAPPED();
+                                                    ovR.hEvent = hReadEv;
+                                                    byte[] inReport = new byte[Math.Max(64, (int)caps.InputReportByteLength)];
+                                                    uint readBytes = 0;
+
+                                                    ReadFile(hDev, inReport, (uint)inReport.Length, out readBytes, ref ovR);
+
+                                                    byte[] outReport = new byte[Math.Max(64, (int)caps.OutputReportByteLength)];
+                                                    outReport[0] = cfg.QueryReportId;
+                                                    if (cfg.QueryPayload != null)
+                                                    {
+                                                        for (int i = 0; i < cfg.QueryPayload.Length && i + 1 < outReport.Length; i++)
+                                                        {
+                                                            outReport[i + 1] = cfg.QueryPayload[i];
+                                                        }
+                                                    }
+
+                                                    OVERLAPPED ovW = new OVERLAPPED();
+                                                    ovW.hEvent = hWriteEv;
+                                                    uint written = 0;
+                                                    WriteFile(hDev, outReport, (uint)outReport.Length, out written, ref ovW);
+                                                    WaitForSingleObject(hWriteEv, 500);
+
+                                                    uint waitRes = WaitForSingleObject(hReadEv, 2000);
+                                                    if (waitRes == 0)
+                                                    {
+                                                        GetOverlappedResult(hDev, ref ovR, out readBytes, false);
+                                                        if (readBytes > cfg.BatteryByteOffset && inReport[0] == cfg.ExpectedResponseReportId)
+                                                        {
+                                                            int pct = inReport[cfg.BatteryByteOffset];
+                                                            if (pct >= 0 && pct <= 100)
+                                                            {
+                                                                string devId = "custom:" + cfg.Name.ToLower();
+                                                                if (!seen.ContainsKey(devId))
+                                                                {
+                                                                    seen[devId] = true;
+                                                                    PeripheralDevice dev = new PeripheralDevice();
+                                                                    dev.Id = devId;
+                                                                    dev.Name = cfg.Name;
+                                                                    dev.BatteryPercentage = pct;
+                                                                    dev.IsConnected = true;
+                                                                    dev.ConnectionType = "Custom 2.4G Receiver";
+                                                                    dev.Protocol = "Custom Query";
+                                                                    dev.Category = cfg.Category;
+                                                                    dev.StatusMessage = "Active - " + pct + "%";
+                                                                    list.Add(dev);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        CancelIo(hDev);
+                                                    }
+                                                }
+                                                finally
+                                                {
+                                                    CancelIo(hDev);
+                                                    CloseHandle(hReadEv);
+                                                    CloseHandle(hWriteEv);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        CloseHandle(hDev);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Marshal.FreeHGlobal(pDetail);
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(hDevInfo);
+            }
+        }
+
+        public static DeviceCategory CategorizeDevice(string name, string hardwareId, string className, ushort usagePage, ushort usage)
+        {
+            if (usagePage == 1)
+            {
+                if (usage == 6) return DeviceCategory.Keyboard;
+                if (usage == 2) return DeviceCategory.Mouse;
+            }
+
+            string s = ((name ?? "") + " " + (hardwareId ?? "") + " " + (className ?? "")).ToLower();
+
+            if (s.Contains("keyboard") || s.Contains("keybrd") || s.Contains(" kb") || s.Contains("trackpoint") || s.Contains("keypad"))
+            {
+                return DeviceCategory.Keyboard;
+            }
+
+            if (s.Contains("mouse") || s.Contains("pointer") || s.Contains("trackball") || s.Contains("touchpad") ||
+                s.Contains(" m6") || s.Contains(" m3") || s.Contains(" m5") || s.Contains("master") || s.Contains("superlight"))
+            {
+                return DeviceCategory.Mouse;
+            }
+
+            if (s.Contains("headset") || s.Contains("headphone") || s.Contains("buds") || s.Contains("airpods") || s.Contains("audio"))
+            {
+                return DeviceCategory.Headset;
+            }
+
+            if (s.Contains("controller") || s.Contains("gamepad") || s.Contains("joystick"))
+            {
+                return DeviceCategory.Controller;
+            }
+
+            return DeviceCategory.Other;
+        }
+    }
+
+    public static class AutoStartManager
+    {
+        private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string AppName = "UniversalPeripheralBatteryMonitor";
+
+        public static bool IsAutoStartEnabled()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, false))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(AppName);
+                        return val != null;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        public static void SetAutoStart(bool enable)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+                {
+                    if (key != null)
+                    {
+                        if (enable)
+                        {
+                            string exePath = Application.ExecutablePath;
+                            key.SetValue(AppName, "\"" + exePath + "\"");
+                        }
+                        else
+                        {
+                            key.DeleteValue(AppName, false);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Could not update Windows startup setting:\n" + ex.Message, "Auto-Start Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+    }
+
+    public class SetupDialog : Form
+    {
+        private ComboBox _cbKeyboard;
+        private ComboBox _cbMouse;
+        private ComboBox _cbInterval;
+        private ComboBox _cbDisplayMode;
+        private ComboBox _cbStyle;
+        private Button _btnSave;
+        private Button _btnCancel;
+
+        private AppSettings _settings;
+        private List<PeripheralDevice> _devices;
+        private Action _onSave;
+
+        public SetupDialog(AppSettings settings, List<PeripheralDevice> devices, Action onSave)
+        {
+            _settings = settings;
+            _devices = devices;
+            _onSave = onSave;
+            InitializeUI();
+        }
+
+        private void InitializeUI()
+        {
+            this.Text = "Universal Peripheral Battery Monitor - Setup";
+            this.Size = new Size(540, 420);
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = false;
+            this.StartPosition = FormStartPosition.CenterScreen;
+            this.BackColor = Color.FromArgb(28, 28, 30);
+            this.ForeColor = Color.White;
+            this.Font = new Font("Segoe UI", 9.5f);
+
+            Label lblHeader = new Label
+            {
+                Text = "⚙ Device Selection & Setup",
+                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+                Location = new Point(20, 15),
+                AutoSize = true
+            };
+            this.Controls.Add(lblHeader);
+
+            Label lblSub = new Label
+            {
+                Text = "Choose which wireless keyboard and mouse to pin to your system tray icons.\nBy default, devices are auto-detected automatically.",
+                Location = new Point(22, 42),
+                Size = new Size(490, 36),
+                ForeColor = Color.FromArgb(180, 180, 180),
+                Font = new Font("Segoe UI", 8.5f)
+            };
+            this.Controls.Add(lblSub);
+
+            // Group: Device Mapping
+            GroupBox gbMapping = new GroupBox
+            {
+                Text = "Primary Devices Assignment",
+                Location = new Point(20, 85),
+                Size = new Size(485, 130),
+                ForeColor = Color.White,
+                BackColor = Color.FromArgb(36, 36, 40)
+            };
+
+            Label lblKb = new Label { Text = "⌨ Primary Keyboard:", Location = new Point(15, 28), AutoSize = true };
+            _cbKeyboard = new ComboBox
+            {
+                Location = new Point(160, 25),
+                Size = new Size(305, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 56),
+                ForeColor = Color.White
+            };
+
+            Label lblM = new Label { Text = "🖱 Primary Mouse:", Location = new Point(15, 75), AutoSize = true };
+            _cbMouse = new ComboBox
+            {
+                Location = new Point(160, 72),
+                Size = new Size(305, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 56),
+                ForeColor = Color.White
+            };
+
+            gbMapping.Controls.Add(lblKb);
+            gbMapping.Controls.Add(_cbKeyboard);
+            gbMapping.Controls.Add(lblM);
+            gbMapping.Controls.Add(_cbMouse);
+            this.Controls.Add(gbMapping);
+
+            // Group: Preferences
+            GroupBox gbPref = new GroupBox
+            {
+                Text = "Tray Display Preferences",
+                Location = new Point(20, 225),
+                Size = new Size(485, 105),
+                ForeColor = Color.White,
+                BackColor = Color.FromArgb(36, 36, 40)
+            };
+
+            Label lblInt = new Label { Text = "Refresh Interval:", Location = new Point(15, 28), AutoSize = true };
+            _cbInterval = new ComboBox
+            {
+                Location = new Point(130, 25),
+                Size = new Size(100, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 56),
+                ForeColor = Color.White
+            };
+            _cbInterval.Items.Add("30 sec");
+            _cbInterval.Items.Add("1 min");
+            _cbInterval.Items.Add("2 min");
+            _cbInterval.Items.Add("5 min");
+            _cbInterval.Items.Add("10 min");
+
+            Label lblMode = new Label { Text = "Tray Mode:", Location = new Point(255, 28), AutoSize = true };
+            _cbDisplayMode = new ComboBox
+            {
+                Location = new Point(335, 25),
+                Size = new Size(130, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 56),
+                ForeColor = Color.White
+            };
+            _cbDisplayMode.Items.Add("Dual Icons");
+            _cbDisplayMode.Items.Add("Keyboard Only");
+            _cbDisplayMode.Items.Add("Mouse Only");
+            _cbDisplayMode.Items.Add("Combined Icon");
+            _cbDisplayMode.Items.Add("All Devices");
+
+            Label lblStyle = new Label { Text = "Icon Style:", Location = new Point(15, 68), AutoSize = true };
+            _cbStyle = new ComboBox
+            {
+                Location = new Point(130, 65),
+                Size = new Size(200, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 56),
+                ForeColor = Color.White
+            };
+            _cbStyle.Items.Add("Badge Number + Bar (Default)");
+            _cbStyle.Items.Add("Large Bold Number");
+            _cbStyle.Items.Add("Battery Gauge Only");
+
+            gbPref.Controls.Add(lblInt);
+            gbPref.Controls.Add(_cbInterval);
+            gbPref.Controls.Add(lblMode);
+            gbPref.Controls.Add(_cbDisplayMode);
+            gbPref.Controls.Add(lblStyle);
+            gbPref.Controls.Add(_cbStyle);
+            this.Controls.Add(gbPref);
+
+            // Buttons
+            _btnSave = new Button
+            {
+                Text = "Save & Apply",
+                Location = new Point(285, 345),
+                Size = new Size(120, 32),
+                BackColor = Color.FromArgb(34, 197, 94),
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = Color.Black,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            _btnSave.Click += delegate
+            {
+                SaveConfig();
+                this.Close();
+            };
+            this.Controls.Add(_btnSave);
+
+            _btnCancel = new Button
+            {
+                Text = "Cancel",
+                Location = new Point(415, 345),
+                Size = new Size(90, 32),
+                BackColor = Color.FromArgb(50, 50, 56),
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = Color.White
+            };
+            _btnCancel.Click += delegate { this.Close(); };
+            this.Controls.Add(_btnCancel);
+
+            PopulateUI();
+        }
+
+        private void PopulateUI()
+        {
+            UpdateDeviceList(_devices);
+
+            if (_settings.PollIntervalSeconds == 30) _cbInterval.SelectedIndex = 0;
+            else if (_settings.PollIntervalSeconds == 60) _cbInterval.SelectedIndex = 1;
+            else if (_settings.PollIntervalSeconds == 300) _cbInterval.SelectedIndex = 3;
+            else if (_settings.PollIntervalSeconds == 600) _cbInterval.SelectedIndex = 4;
+            else _cbInterval.SelectedIndex = 2; // 2 min
+
+            _cbDisplayMode.SelectedIndex = Math.Max(0, Math.Min(4, _settings.DisplayMode));
+            _cbStyle.SelectedIndex = Math.Max(0, Math.Min(2, _settings.IconStyle));
+        }
+
+        public void UpdateDeviceList(List<PeripheralDevice> devices)
+        {
+            _devices = devices ?? new List<PeripheralDevice>();
+
+            _cbKeyboard.Items.Clear();
+            _cbKeyboard.Items.Add("Auto-Detect (Recommended)");
+
+            _cbMouse.Items.Clear();
+            _cbMouse.Items.Add("Auto-Detect (Recommended)");
+
+            int selectedKbIdx = 0;
+            int selectedMouseIdx = 0;
+
+            for (int i = 0; i < _devices.Count; i++)
+            {
+                var d = _devices[i];
+                string label = string.Format("{0} [{1}] - {2}% ({3})", d.Name, d.Category, d.BatteryPercentage >= 0 ? d.BatteryPercentage.ToString() : "--", d.ConnectionType);
+
+                int itemKb = _cbKeyboard.Items.Add(label);
+                if (d.Id == _settings.PreferredKeyboardId) selectedKbIdx = itemKb;
+
+                int itemM = _cbMouse.Items.Add(label);
+                if (d.Id == _settings.PreferredMouseId) selectedMouseIdx = itemM;
+            }
+
+            _cbKeyboard.SelectedIndex = selectedKbIdx;
+            _cbMouse.SelectedIndex = selectedMouseIdx;
+        }
+
+        private void SaveConfig()
+        {
+            if (_cbKeyboard.SelectedIndex > 0 && _cbKeyboard.SelectedIndex - 1 < _devices.Count)
+            {
+                _settings.PreferredKeyboardId = _devices[_cbKeyboard.SelectedIndex - 1].Id;
+            }
+            else
+            {
+                _settings.PreferredKeyboardId = "auto";
+            }
+
+            if (_cbMouse.SelectedIndex > 0 && _cbMouse.SelectedIndex - 1 < _devices.Count)
+            {
+                _settings.PreferredMouseId = _devices[_cbMouse.SelectedIndex - 1].Id;
+            }
+            else
+            {
+                _settings.PreferredMouseId = "auto";
+            }
+
+            if (_cbInterval.SelectedIndex == 0) _settings.PollIntervalSeconds = 30;
+            else if (_cbInterval.SelectedIndex == 1) _settings.PollIntervalSeconds = 60;
+            else if (_cbInterval.SelectedIndex == 3) _settings.PollIntervalSeconds = 300;
+            else if (_cbInterval.SelectedIndex == 4) _settings.PollIntervalSeconds = 600;
+            else _settings.PollIntervalSeconds = 120;
+
+            _settings.DisplayMode = _cbDisplayMode.SelectedIndex;
+            _settings.IconStyle = _cbStyle.SelectedIndex;
+
+            if (_onSave != null)
+            {
+                _onSave();
+            }
+        }
+    }
+
+    public class DashboardForm : Form
+    {
+        private FlowLayoutPanel _flpCards;
+        private Label _lblStatus;
+        private Button _btnRefresh;
+        private Button _btnSetup;
+        private Button _btnClose;
+
+        private Action _refreshAction;
+        private Action _setupAction;
+
+        public DashboardForm(List<PeripheralDevice> devices, PeripheralDevice kb, PeripheralDevice mouse, Action refreshAction, Action setupAction)
+        {
+            _refreshAction = refreshAction;
+            _setupAction = setupAction;
+            InitializeUI();
+            UpdateDashboard(devices, kb, mouse);
+        }
+
+        private void InitializeUI()
+        {
+            this.Text = "Universal Peripheral Battery Dashboard";
+            this.Size = new Size(540, 480);
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = true;
+            this.StartPosition = FormStartPosition.CenterScreen;
+            this.BackColor = Color.FromArgb(28, 28, 30);
+            this.ForeColor = Color.White;
+            this.Font = new Font("Segoe UI", 9.5f);
+
+            Label lblHeader = new Label
+            {
+                Text = "🔋 Wireless Peripherals Battery Levels",
+                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+                Location = new Point(20, 15),
+                AutoSize = true
+            };
+            this.Controls.Add(lblHeader);
+
+            _flpCards = new FlowLayoutPanel
+            {
+                Location = new Point(20, 50),
+                Size = new Size(485, 330),
+                AutoScroll = true,
+                BackColor = Color.FromArgb(24, 24, 26),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            this.Controls.Add(_flpCards);
+
+            _lblStatus = new Label
+            {
+                Text = "Last updated: Just now",
+                Location = new Point(20, 395),
+                Font = new Font("Segoe UI", 8.5f),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(160, 160, 160)
+            };
+            this.Controls.Add(_lblStatus);
+
+            _btnRefresh = new Button
+            {
+                Text = "🔄 Refresh",
+                Location = new Point(230, 390),
+                Size = new Size(95, 32),
+                BackColor = Color.FromArgb(50, 50, 56),
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = Color.White
+            };
+            _btnRefresh.Click += delegate
+            {
+                _btnRefresh.Enabled = false;
+                _btnRefresh.Text = "Polling...";
+                if (_refreshAction != null)
+                {
+                    _refreshAction();
+                }
+                System.Windows.Forms.Timer t = new System.Windows.Forms.Timer { Interval = 2500 };
+                t.Tick += delegate
+                {
+                    _btnRefresh.Enabled = true;
+                    _btnRefresh.Text = "🔄 Refresh";
+                    t.Stop();
+                    t.Dispose();
+                };
+                t.Start();
+            };
+            this.Controls.Add(_btnRefresh);
+
+            _btnSetup = new Button
+            {
+                Text = "⚙ Setup",
+                Location = new Point(335, 390),
+                Size = new Size(90, 32),
+                BackColor = Color.FromArgb(50, 50, 56),
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = Color.White
+            };
+            _btnSetup.Click += delegate
+            {
+                if (_setupAction != null)
+                {
+                    _setupAction();
+                }
+            };
+            this.Controls.Add(_btnSetup);
+
+            _btnClose = new Button
+            {
+                Text = "Close",
+                Location = new Point(435, 390),
+                Size = new Size(70, 32),
+                BackColor = Color.FromArgb(50, 50, 56),
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = Color.White
+            };
+            _btnClose.Click += delegate { this.Close(); };
+            this.Controls.Add(_btnClose);
+        }
+
+        public void UpdateDashboard(List<PeripheralDevice> devices, PeripheralDevice kb, PeripheralDevice mouse)
+        {
+            if (this.InvokeRequired)
+            {
+                this.Invoke((MethodInvoker)delegate { UpdateDashboard(devices, kb, mouse); });
+                return;
+            }
+
+            _flpCards.SuspendLayout();
+            _flpCards.Controls.Clear();
+
+            if (devices == null || devices.Count == 0)
+            {
+                Label emptyLbl = new Label
+                {
+                    Text = "No wireless peripherals detected.\nEnsure devices are turned on and connected via Bluetooth or Dongle.",
+                    Size = new Size(460, 60),
+                    ForeColor = Color.FromArgb(160, 160, 160),
+                    TextAlign = ContentAlignment.MiddleCenter
+                };
+                _flpCards.Controls.Add(emptyLbl);
+            }
+            else
+            {
+                foreach (var dev in devices)
+                {
+                    Panel card = new Panel
+                    {
+                        Size = new Size(455, 95),
+                        BackColor = Color.FromArgb(38, 38, 42),
+                        BorderStyle = BorderStyle.FixedSingle,
+                        Margin = new Padding(3, 4, 3, 6)
+                    };
+
+                    string iconPrefix = dev.Category == DeviceCategory.Keyboard ? "⌨ " :
+                                        dev.Category == DeviceCategory.Mouse ? "🖱 " :
+                                        dev.Category == DeviceCategory.Headset ? "🎧 " : "🔋 ";
+
+                    string isPrimary = (dev == kb || dev == mouse) ? "  [★ System Tray]" : "";
+
+                    Label lblName = new Label
+                    {
+                        Text = iconPrefix + dev.Name + isPrimary,
+                        Location = new Point(12, 10),
+                        Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                        AutoSize = true,
+                        ForeColor = (dev == kb || dev == mouse) ? Color.White : Color.FromArgb(220, 220, 220)
+                    };
+
+                    Color pctColor = GetColorForPercentage(dev.BatteryPercentage);
+                    Label lblPct = new Label
+                    {
+                        Text = dev.GetDisplayPercentage(),
+                        Location = new Point(370, 8),
+                        Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+                        AutoSize = true,
+                        ForeColor = pctColor
+                    };
+
+                    ProgressBar pb = new ProgressBar
+                    {
+                        Location = new Point(14, 38),
+                        Size = new Size(425, 18),
+                        Maximum = 100,
+                        Minimum = 0,
+                        Value = Math.Max(0, Math.Min(100, dev.BatteryPercentage >= 0 ? dev.BatteryPercentage : 0))
+                    };
+
+                    Label lblDetails = new Label
+                    {
+                        Text = string.Format("Connection: {0} | Protocol: {1} | Status: {2}",
+                            dev.ConnectionType, dev.Protocol ?? "Standard", dev.StatusMessage ?? "Online"),
+                        Location = new Point(12, 63),
+                        Font = new Font("Segoe UI", 8.5f),
+                        AutoSize = true,
+                        ForeColor = Color.FromArgb(170, 170, 170)
+                    };
+
+                    card.Controls.Add(lblName);
+                    card.Controls.Add(lblPct);
+                    card.Controls.Add(pb);
+                    card.Controls.Add(lblDetails);
+                    _flpCards.Controls.Add(card);
+                }
+            }
+
+            _flpCards.ResumeLayout();
+            _lblStatus.Text = "Last updated: " + DateTime.Now.ToString("HH:mm:ss");
+        }
+
+        private Color GetColorForPercentage(int pct)
+        {
+            if (pct >= 50) return Color.FromArgb(34, 197, 94); // Green
+            if (pct >= 20) return Color.FromArgb(245, 158, 11); // Amber
+            if (pct >= 0) return Color.FromArgb(239, 68, 68); // Red
+            return Color.FromArgb(140, 140, 140);
+        }
+    }
+}
