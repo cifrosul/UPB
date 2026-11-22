@@ -2,9 +2,11 @@
 setlocal
 echo Stopping Universal Peripheral Battery Monitor...
 taskkill /f /im UniversalPeripheralBatteryMonitor.exe >nul 2>&1
-if %ERRORLEVEL% equ 0 (
-    echo [SUCCESS] Universal Peripheral Battery Monitor stopped.
-) else (
-    echo [INFO] Process was not running.
+taskkill /f /im UniversalPeripheralBatteryMonitor.old.exe >nul 2>&1
+
+if exist "%~dp0UniversalPeripheralBatteryMonitor.old.exe" (
+    del /f /q "%~dp0UniversalPeripheralBatteryMonitor.old.exe" >nul 2>&1
 )
+
+echo [SUCCESS] Universal Peripheral Battery Monitor stopped.
 endlocal

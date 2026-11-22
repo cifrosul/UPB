@@ -4,6 +4,11 @@ cd /d "%~dp0"
 
 echo Stopping any running instance...
 taskkill /f /im UniversalPeripheralBatteryMonitor.exe >nul 2>&1
+taskkill /f /im UniversalPeripheralBatteryMonitor.old.exe >nul 2>&1
+
+if exist "%~dp0UniversalPeripheralBatteryMonitor.old.exe" (
+    del /f /q "%~dp0UniversalPeripheralBatteryMonitor.old.exe" >nul 2>&1
+)
 
 if not exist "%~dp0UniversalPeripheralBatteryMonitor.exe" (
     echo Binary not found. Building first...
