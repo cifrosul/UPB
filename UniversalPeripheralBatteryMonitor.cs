@@ -126,8 +126,8 @@ namespace UniversalPeripheralBatteryMonitor
             {
                 case DeviceCategory.Keyboard: return "KB";
                 case DeviceCategory.Mouse: return "M";
-                case DeviceCategory.Headset: return "🎧";
-                case DeviceCategory.Controller: return "🎮";
+                case DeviceCategory.Headset: return "H";
+                case DeviceCategory.Controller: return "PAD";
                 default: return "DEV";
             }
         }
@@ -306,7 +306,7 @@ namespace UniversalPeripheralBatteryMonitor
             _contextMenu = new ContextMenuStrip();
             _contextMenu.Font = new Font("Segoe UI", 9f);
 
-            _menuHeader = new ToolStripMenuItem("🔋 Universal Peripheral Battery Monitor");
+            _menuHeader = new ToolStripMenuItem("Universal Peripheral Battery Monitor");
             _menuHeader.Enabled = false;
             _menuHeader.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
             _contextMenu.Items.Add(_menuHeader);
@@ -318,11 +318,11 @@ namespace UniversalPeripheralBatteryMonitor
             _contextMenu.Items.Add(_menuDevicesGroup);
             _contextMenu.Items.Add(new ToolStripSeparator());
 
-            _menuRefresh = new ToolStripMenuItem("🔄 Refresh Now", null, delegate { PerformPollAsync(); });
+            _menuRefresh = new ToolStripMenuItem("Refresh Now", null, delegate { PerformPollAsync(); });
             _contextMenu.Items.Add(_menuRefresh);
 
             // Interval menu
-            _menuInterval = new ToolStripMenuItem("⏱ Polling Interval");
+            _menuInterval = new ToolStripMenuItem("Polling Interval");
             AddIntervalOption(_menuInterval, "30 seconds", 30);
             AddIntervalOption(_menuInterval, "1 minute", 60);
             AddIntervalOption(_menuInterval, "2 minutes", 120, _settings.PollIntervalSeconds == 120);
@@ -331,7 +331,7 @@ namespace UniversalPeripheralBatteryMonitor
             _contextMenu.Items.Add(_menuInterval);
 
             // Display Mode menu
-            _menuDisplayMode = new ToolStripMenuItem("🎛 Tray Display Mode");
+            _menuDisplayMode = new ToolStripMenuItem("Tray Display Mode");
             AddDisplayModeOption(_menuDisplayMode, "Dual Icons (Keyboard & Mouse)", 0, _settings.DisplayMode == 0);
             AddDisplayModeOption(_menuDisplayMode, "Keyboard Icon Only", 1, _settings.DisplayMode == 1);
             AddDisplayModeOption(_menuDisplayMode, "Mouse Icon Only", 2, _settings.DisplayMode == 2);
@@ -340,7 +340,7 @@ namespace UniversalPeripheralBatteryMonitor
             _contextMenu.Items.Add(_menuDisplayMode);
 
             // Icon Style menu
-            _menuIconStyle = new ToolStripMenuItem("🎨 Icon Visual Style");
+            _menuIconStyle = new ToolStripMenuItem("Icon Visual Style");
             AddStyleOption(_menuIconStyle, "Badge Number + Battery Bar", 0, _settings.IconStyle == 0);
             AddStyleOption(_menuIconStyle, "Large Bold Number", 1, _settings.IconStyle == 1);
             AddStyleOption(_menuIconStyle, "Battery Gauge Only", 2, _settings.IconStyle == 2);
@@ -349,20 +349,20 @@ namespace UniversalPeripheralBatteryMonitor
             _contextMenu.Items.Add(new ToolStripSeparator());
 
             // Setup / Configuration
-            _menuSetup = new ToolStripMenuItem("⚙ Device Setup & Configuration...", null, delegate { ShowSetupDialog(); });
+            _menuSetup = new ToolStripMenuItem("Device Setup & Configuration...", null, delegate { ShowSetupDialog(); });
             _contextMenu.Items.Add(_menuSetup);
 
-            _menuDashboard = new ToolStripMenuItem("📊 Battery Dashboard...", null, delegate { ShowDashboard(); });
+            _menuDashboard = new ToolStripMenuItem("Battery Dashboard...", null, delegate { ShowDashboard(); });
             _contextMenu.Items.Add(_menuDashboard);
 
             // Autostart
-            _menuAutoStart = new ToolStripMenuItem("🚀 Start with Windows", null, ToggleAutoStart);
+            _menuAutoStart = new ToolStripMenuItem("Start with Windows", null, ToggleAutoStart);
             _menuAutoStart.Checked = AutoStartManager.IsAutoStartEnabled();
             _contextMenu.Items.Add(_menuAutoStart);
 
             _contextMenu.Items.Add(new ToolStripSeparator());
 
-            _menuExit = new ToolStripMenuItem("❌ Exit", null, delegate { ExitApp(); });
+            _menuExit = new ToolStripMenuItem("Exit", null, delegate { ExitApp(); });
             _contextMenu.Items.Add(_menuExit);
 
             // Immediate initial icons
@@ -634,11 +634,11 @@ namespace UniversalPeripheralBatteryMonitor
             {
                 foreach (var dev in _detectedDevices)
                 {
-                    string iconPrefix = dev.Category == DeviceCategory.Keyboard ? "⌨ " :
-                                        dev.Category == DeviceCategory.Mouse ? "🖱 " :
-                                        dev.Category == DeviceCategory.Headset ? "🎧 " : "🔋 ";
+                    string iconPrefix = dev.Category == DeviceCategory.Keyboard ? "[KB] " :
+                                        dev.Category == DeviceCategory.Mouse ? "[Mouse] " :
+                                        dev.Category == DeviceCategory.Headset ? "[Headset] " : "[Device] ";
 
-                    string isPrimary = (dev == _activeKeyboard || dev == _activeMouse) ? " ★" : "";
+                    string isPrimary = (dev == _activeKeyboard || dev == _activeMouse) ? " [Primary]" : "";
                     string text = string.Format("{0}{1}: {2} ({3}){4}",
                         iconPrefix, dev.Name, dev.GetDisplayPercentage(), dev.ConnectionType, isPrimary);
 
@@ -1887,6 +1887,113 @@ namespace UniversalPeripheralBatteryMonitor
         }
     }
 
+    public class ModernSectionPanel : Panel
+    {
+        private string _title;
+        public string Title
+        {
+            get { return _title; }
+            set { _title = value; Invalidate(); }
+        }
+
+        public ModernSectionPanel(string title)
+        {
+            _title = title;
+            this.BackColor = Color.FromArgb(28, 29, 33);
+            this.Padding = new Padding(15, 30, 15, 15);
+            this.DoubleBuffered = true;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            // Border
+            using (Pen p = new Pen(Color.FromArgb(50, 52, 60), 1f))
+            {
+                Rectangle r = new Rectangle(0, 0, this.Width - 1, this.Height - 1);
+                g.DrawRectangle(p, r);
+            }
+
+            // Left accent bar
+            using (Brush b = new SolidBrush(Color.FromArgb(59, 130, 246))) // Blue accent
+            {
+                g.FillRectangle(b, 0, 0, 4, this.Height);
+            }
+
+            // Title
+            if (!string.IsNullOrEmpty(_title))
+            {
+                using (Font f = new Font("Segoe UI", 9.5f, FontStyle.Bold))
+                using (Brush bText = new SolidBrush(Color.FromArgb(240, 240, 245)))
+                {
+                    g.DrawString(_title, f, bText, 14, 8);
+                }
+            }
+        }
+    }
+
+    public class ModernBatteryBar : Panel
+    {
+        private int _percentage;
+        private bool _isConnected;
+
+        public int Percentage
+        {
+            get { return _percentage; }
+            set { _percentage = value; Invalidate(); }
+        }
+
+        public bool IsConnected
+        {
+            get { return _isConnected; }
+            set { _isConnected = value; Invalidate(); }
+        }
+
+        public ModernBatteryBar(int pct, bool connected)
+        {
+            _percentage = pct;
+            _isConnected = connected;
+            this.Height = 14;
+            this.DoubleBuffered = true;
+            this.BackColor = Color.FromArgb(22, 23, 26);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            int w = this.Width;
+            int h = this.Height;
+
+            // Track background
+            using (Brush bTrack = new SolidBrush(Color.FromArgb(24, 25, 28)))
+            using (Pen pBorder = new Pen(Color.FromArgb(55, 57, 65), 1f))
+            {
+                g.FillRectangle(bTrack, 0, 0, w - 1, h - 1);
+                g.DrawRectangle(pBorder, 0, 0, w - 1, h - 1);
+            }
+
+            // Fill
+            if (_isConnected && _percentage > 0)
+            {
+                int fillWidth = Math.Max(4, (int)((w - 4) * (Math.Min(100, _percentage) / 100.0)));
+                Color barColor = Color.FromArgb(34, 197, 94); // Green
+                if (_percentage < 20) barColor = Color.FromArgb(239, 68, 68); // Red
+                else if (_percentage < 50) barColor = Color.FromArgb(245, 158, 11); // Amber
+
+                using (Brush bFill = new SolidBrush(barColor))
+                {
+                    g.FillRectangle(bFill, 2, 2, fillWidth, h - 4);
+                }
+            }
+        }
+    }
+
     public class SetupDialog : Form
     {
         private ComboBox _cbKeyboard;
@@ -1912,142 +2019,195 @@ namespace UniversalPeripheralBatteryMonitor
         private void InitializeUI()
         {
             this.Text = "Universal Peripheral Battery Monitor - Setup";
-            this.Size = new Size(540, 420);
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.BackColor = Color.FromArgb(28, 28, 30);
+            this.BackColor = Color.FromArgb(18, 18, 20);
             this.ForeColor = Color.White;
             this.Font = new Font("Segoe UI", 9.5f);
+            this.AutoScaleMode = AutoScaleMode.Dpi;
+            this.DoubleBuffered = true;
 
             Label lblHeader = new Label
             {
-                Text = "⚙ Device Selection & Setup",
-                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-                Location = new Point(20, 15),
-                AutoSize = true
+                Text = "Device Setup & Configuration",
+                UseMnemonic = false,
+                Font = new Font("Segoe UI", 13f, FontStyle.Bold),
+                Location = new Point(22, 14),
+                AutoSize = true,
+                ForeColor = Color.White
             };
             this.Controls.Add(lblHeader);
 
             Label lblSub = new Label
             {
-                Text = "Choose which wireless keyboard and mouse to pin to your system tray icons.\nBy default, devices are auto-detected automatically.",
-                Location = new Point(22, 42),
-                Size = new Size(490, 36),
-                ForeColor = Color.FromArgb(180, 180, 180),
-                Font = new Font("Segoe UI", 8.5f)
+                Text = "Configure which wireless peripherals are pinned to your taskbar tray icons.",
+                Font = new Font("Segoe UI", 8.5f),
+                Location = new Point(22, lblHeader.Bottom + 6),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(156, 163, 175)
             };
             this.Controls.Add(lblSub);
 
-            // Group: Device Mapping
-            GroupBox gbMapping = new GroupBox
+            // Section 1: Device Mapping
+            int pnl1Y = lblSub.Bottom + 12;
+            ModernSectionPanel pnlMapping = new ModernSectionPanel("Primary Peripherals Assignment")
             {
-                Text = "Primary Devices Assignment",
-                Location = new Point(20, 85),
-                Size = new Size(485, 130),
-                ForeColor = Color.White,
-                BackColor = Color.FromArgb(36, 36, 40)
+                Location = new Point(20, pnl1Y),
+                Size = new Size(595, 170)
             };
 
-            Label lblKb = new Label { Text = "⌨ Primary Keyboard:", Location = new Point(15, 28), AutoSize = true };
+            Label lblKb = new Label
+            {
+                Text = "Primary Keyboard:",
+                Location = new Point(18, 42),
+                Size = new Size(150, 24),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(230, 230, 235),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
             _cbKeyboard = new ComboBox
             {
-                Location = new Point(160, 25),
-                Size = new Size(305, 26),
+                Location = new Point(175, 40),
+                Size = new Size(395, 28),
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(50, 50, 56),
+                BackColor = Color.FromArgb(42, 44, 50),
                 ForeColor = Color.White
             };
 
-            Label lblM = new Label { Text = "🖱 Primary Mouse:", Location = new Point(15, 75), AutoSize = true };
+            Label lblM = new Label
+            {
+                Text = "Primary Mouse:",
+                Location = new Point(18, 87),
+                Size = new Size(150, 24),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(230, 230, 235),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
             _cbMouse = new ComboBox
             {
-                Location = new Point(160, 72),
-                Size = new Size(305, 26),
+                Location = new Point(175, 85),
+                Size = new Size(395, 28),
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(50, 50, 56),
+                BackColor = Color.FromArgb(42, 44, 50),
                 ForeColor = Color.White
             };
 
-            gbMapping.Controls.Add(lblKb);
-            gbMapping.Controls.Add(_cbKeyboard);
-            gbMapping.Controls.Add(lblM);
-            gbMapping.Controls.Add(_cbMouse);
-            this.Controls.Add(gbMapping);
-
-            // Group: Preferences
-            GroupBox gbPref = new GroupBox
+            Label lblMappingTip = new Label
             {
-                Text = "Tray Display Preferences",
-                Location = new Point(20, 225),
-                Size = new Size(485, 105),
-                ForeColor = Color.White,
-                BackColor = Color.FromArgb(36, 36, 40)
+                Text = "Tip: When set to Auto-Detect, the highest-confidence active devices are selected automatically.",
+                Location = new Point(18, 130),
+                Size = new Size(550, 20),
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = Color.FromArgb(150, 150, 160)
             };
 
-            Label lblInt = new Label { Text = "Refresh Interval:", Location = new Point(15, 28), AutoSize = true };
-            _cbInterval = new ComboBox
-            {
-                Location = new Point(130, 25),
-                Size = new Size(100, 26),
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(50, 50, 56),
-                ForeColor = Color.White
-            };
-            _cbInterval.Items.Add("30 sec");
-            _cbInterval.Items.Add("1 min");
-            _cbInterval.Items.Add("2 min");
-            _cbInterval.Items.Add("5 min");
-            _cbInterval.Items.Add("10 min");
+            pnlMapping.Controls.Add(lblKb);
+            pnlMapping.Controls.Add(_cbKeyboard);
+            pnlMapping.Controls.Add(lblM);
+            pnlMapping.Controls.Add(_cbMouse);
+            pnlMapping.Controls.Add(lblMappingTip);
+            this.Controls.Add(pnlMapping);
 
-            Label lblMode = new Label { Text = "Tray Mode:", Location = new Point(255, 28), AutoSize = true };
+            // Section 2: Preferences
+            int pnl2Y = pnlMapping.Bottom + 14;
+            ModernSectionPanel pnlPref = new ModernSectionPanel("Tray Display & Polling Preferences")
+            {
+                Location = new Point(20, pnl2Y),
+                Size = new Size(595, 195)
+            };
+
+            Label lblMode = new Label
+            {
+                Text = "Tray Display Mode:",
+                Location = new Point(18, 42),
+                Size = new Size(150, 24),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(230, 230, 235),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
             _cbDisplayMode = new ComboBox
             {
-                Location = new Point(335, 25),
-                Size = new Size(130, 26),
+                Location = new Point(175, 40),
+                Size = new Size(395, 28),
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(50, 50, 56),
+                BackColor = Color.FromArgb(42, 44, 50),
                 ForeColor = Color.White
             };
-            _cbDisplayMode.Items.Add("Dual Icons");
-            _cbDisplayMode.Items.Add("Keyboard Only");
-            _cbDisplayMode.Items.Add("Mouse Only");
-            _cbDisplayMode.Items.Add("Combined Icon");
-            _cbDisplayMode.Items.Add("All Devices");
+            _cbDisplayMode.Items.Add("Dual Icons (Separate Keyboard & Mouse Icons)");
+            _cbDisplayMode.Items.Add("Keyboard Icon Only");
+            _cbDisplayMode.Items.Add("Mouse Icon Only");
+            _cbDisplayMode.Items.Add("Combined Single Icon (K:44 M:69)");
+            _cbDisplayMode.Items.Add("All Detected Wireless Devices");
 
-            Label lblStyle = new Label { Text = "Icon Style:", Location = new Point(15, 68), AutoSize = true };
+            Label lblStyle = new Label
+            {
+                Text = "Icon Visual Style:",
+                Location = new Point(18, 87),
+                Size = new Size(150, 24),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(230, 230, 235),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
             _cbStyle = new ComboBox
             {
-                Location = new Point(130, 65),
-                Size = new Size(200, 26),
+                Location = new Point(175, 85),
+                Size = new Size(395, 28),
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(50, 50, 56),
+                BackColor = Color.FromArgb(42, 44, 50),
                 ForeColor = Color.White
             };
-            _cbStyle.Items.Add("Badge Number + Bar (Default)");
-            _cbStyle.Items.Add("Large Bold Number");
-            _cbStyle.Items.Add("Battery Gauge Only");
+            _cbStyle.Items.Add("Badge Number + Battery Bar (Default)");
+            _cbStyle.Items.Add("Large Bold Number (High Visibility)");
+            _cbStyle.Items.Add("Battery Gauge / Dial Only");
 
-            gbPref.Controls.Add(lblInt);
-            gbPref.Controls.Add(_cbInterval);
-            gbPref.Controls.Add(lblMode);
-            gbPref.Controls.Add(_cbDisplayMode);
-            gbPref.Controls.Add(lblStyle);
-            gbPref.Controls.Add(_cbStyle);
-            this.Controls.Add(gbPref);
+            Label lblInt = new Label
+            {
+                Text = "Polling Interval:",
+                Location = new Point(18, 132),
+                Size = new Size(150, 24),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(230, 230, 235),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            _cbInterval = new ComboBox
+            {
+                Location = new Point(175, 130),
+                Size = new Size(200, 28),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(42, 44, 50),
+                ForeColor = Color.White
+            };
+            _cbInterval.Items.Add("30 seconds");
+            _cbInterval.Items.Add("1 minute");
+            _cbInterval.Items.Add("2 minutes (Default)");
+            _cbInterval.Items.Add("5 minutes");
+            _cbInterval.Items.Add("10 minutes");
 
-            // Buttons
+            pnlPref.Controls.Add(lblMode);
+            pnlPref.Controls.Add(_cbDisplayMode);
+            pnlPref.Controls.Add(lblStyle);
+            pnlPref.Controls.Add(_cbStyle);
+            pnlPref.Controls.Add(lblInt);
+            pnlPref.Controls.Add(_cbInterval);
+            this.Controls.Add(pnlPref);
+
+            // Action Buttons
+            int btnY = pnlPref.Bottom + 16;
             _btnSave = new Button
             {
                 Text = "Save & Apply",
-                Location = new Point(285, 345),
-                Size = new Size(120, 32),
+                UseMnemonic = false,
+                Location = new Point(345, btnY),
+                Size = new Size(140, 36),
                 BackColor = Color.FromArgb(34, 197, 94),
                 FlatStyle = FlatStyle.Flat,
                 ForeColor = Color.Black,
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                Cursor = Cursors.Hand
             };
+            _btnSave.FlatAppearance.BorderSize = 0;
             _btnSave.Click += delegate
             {
                 SaveConfig();
@@ -2058,14 +2218,28 @@ namespace UniversalPeripheralBatteryMonitor
             _btnCancel = new Button
             {
                 Text = "Cancel",
-                Location = new Point(415, 345),
-                Size = new Size(90, 32),
-                BackColor = Color.FromArgb(50, 50, 56),
+                Location = new Point(495, btnY),
+                Size = new Size(120, 36),
+                BackColor = Color.FromArgb(45, 47, 54),
                 FlatStyle = FlatStyle.Flat,
-                ForeColor = Color.White
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9.5f)
             };
+            _btnCancel.FlatAppearance.BorderColor = Color.FromArgb(65, 67, 75);
             _btnCancel.Click += delegate { this.Close(); };
             this.Controls.Add(_btnCancel);
+
+            // Set responsive client size
+            this.ClientSize = new Size(635, btnY + 52);
+
+            // Adaptive height check for small screens / high scaling
+            Rectangle workArea = Screen.FromControl(this).WorkingArea;
+            int maxAllowedH = (int)(workArea.Height * 0.92);
+            if (this.Height > maxAllowedH)
+            {
+                this.Height = maxAllowedH;
+                this.AutoScroll = true;
+            }
 
             PopulateUI();
         }
@@ -2171,53 +2345,71 @@ namespace UniversalPeripheralBatteryMonitor
         private void InitializeUI()
         {
             this.Text = "Universal Peripheral Battery Dashboard";
-            this.Size = new Size(540, 480);
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = true;
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.BackColor = Color.FromArgb(28, 28, 30);
+            this.BackColor = Color.FromArgb(18, 18, 20);
             this.ForeColor = Color.White;
             this.Font = new Font("Segoe UI", 9.5f);
+            this.AutoScaleMode = AutoScaleMode.Dpi;
+            this.DoubleBuffered = true;
 
             Label lblHeader = new Label
             {
-                Text = "🔋 Wireless Peripherals Battery Levels",
-                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-                Location = new Point(20, 15),
-                AutoSize = true
+                Text = "Wireless Peripherals Battery Monitor",
+                Font = new Font("Segoe UI", 13f, FontStyle.Bold),
+                Location = new Point(22, 14),
+                AutoSize = true,
+                ForeColor = Color.White,
+                UseMnemonic = false
             };
             this.Controls.Add(lblHeader);
 
+            Label lblSub = new Label
+            {
+                Text = "Live battery status and hardware metrics across all wireless peripherals",
+                Font = new Font("Segoe UI", 8.5f),
+                Location = new Point(22, lblHeader.Bottom + 6),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(156, 163, 175)
+            };
+            this.Controls.Add(lblSub);
+
+            int listY = lblSub.Bottom + 12;
             _flpCards = new FlowLayoutPanel
             {
-                Location = new Point(20, 50),
-                Size = new Size(485, 330),
+                Location = new Point(20, listY),
+                Size = new Size(595, 430),
                 AutoScroll = true,
-                BackColor = Color.FromArgb(24, 24, 26),
-                BorderStyle = BorderStyle.FixedSingle
+                BackColor = Color.Transparent,
+                WrapContents = false,
+                FlowDirection = FlowDirection.TopDown
             };
             this.Controls.Add(_flpCards);
 
+            int footerY = _flpCards.Bottom + 12;
             _lblStatus = new Label
             {
                 Text = "Last updated: Just now",
-                Location = new Point(20, 395),
+                Location = new Point(22, footerY + 8),
                 Font = new Font("Segoe UI", 8.5f),
-                AutoSize = true,
-                ForeColor = Color.FromArgb(160, 160, 160)
+                ForeColor = Color.FromArgb(140, 140, 148),
+                AutoSize = true
             };
             this.Controls.Add(_lblStatus);
 
             _btnRefresh = new Button
             {
-                Text = "🔄 Refresh",
-                Location = new Point(230, 390),
-                Size = new Size(95, 32),
-                BackColor = Color.FromArgb(50, 50, 56),
+                Text = "Refresh",
+                Location = new Point(310, footerY),
+                Size = new Size(95, 34),
+                BackColor = Color.FromArgb(45, 47, 54),
                 FlatStyle = FlatStyle.Flat,
-                ForeColor = Color.White
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9f)
             };
+            _btnRefresh.FlatAppearance.BorderColor = Color.FromArgb(65, 67, 75);
             _btnRefresh.Click += delegate
             {
                 _btnRefresh.Enabled = false;
@@ -2230,7 +2422,7 @@ namespace UniversalPeripheralBatteryMonitor
                 t.Tick += delegate
                 {
                     _btnRefresh.Enabled = true;
-                    _btnRefresh.Text = "🔄 Refresh";
+                    _btnRefresh.Text = "Refresh";
                     t.Stop();
                     t.Dispose();
                 };
@@ -2240,13 +2432,15 @@ namespace UniversalPeripheralBatteryMonitor
 
             _btnSetup = new Button
             {
-                Text = "⚙ Setup",
-                Location = new Point(335, 390),
-                Size = new Size(90, 32),
-                BackColor = Color.FromArgb(50, 50, 56),
+                Text = "Setup...",
+                Location = new Point(415, footerY),
+                Size = new Size(95, 34),
+                BackColor = Color.FromArgb(45, 47, 54),
                 FlatStyle = FlatStyle.Flat,
-                ForeColor = Color.White
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9f)
             };
+            _btnSetup.FlatAppearance.BorderColor = Color.FromArgb(65, 67, 75);
             _btnSetup.Click += delegate
             {
                 if (_setupAction != null)
@@ -2259,14 +2453,31 @@ namespace UniversalPeripheralBatteryMonitor
             _btnClose = new Button
             {
                 Text = "Close",
-                Location = new Point(435, 390),
-                Size = new Size(70, 32),
-                BackColor = Color.FromArgb(50, 50, 56),
+                Location = new Point(520, footerY),
+                Size = new Size(95, 34),
+                BackColor = Color.FromArgb(45, 47, 54),
                 FlatStyle = FlatStyle.Flat,
-                ForeColor = Color.White
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9f)
             };
+            _btnClose.FlatAppearance.BorderColor = Color.FromArgb(65, 67, 75);
             _btnClose.Click += delegate { this.Close(); };
             this.Controls.Add(_btnClose);
+
+            // Responsive sizing based on working area
+            this.ClientSize = new Size(635, footerY + 48);
+
+            Rectangle workArea = Screen.FromControl(this).WorkingArea;
+            int maxAllowedH = (int)(workArea.Height * 0.90);
+            if (this.Height > maxAllowedH)
+            {
+                this.Height = maxAllowedH;
+                _flpCards.Height = this.ClientSize.Height - _flpCards.Top - 56;
+                _btnRefresh.Top = this.ClientSize.Height - 44;
+                _btnSetup.Top = this.ClientSize.Height - 44;
+                _btnClose.Top = this.ClientSize.Height - 44;
+                _lblStatus.Top = this.ClientSize.Height - 36;
+            }
         }
 
         public void UpdateDashboard(List<PeripheralDevice> devices, PeripheralDevice kb, PeripheralDevice mouse)
@@ -2282,75 +2493,138 @@ namespace UniversalPeripheralBatteryMonitor
 
             if (devices == null || devices.Count == 0)
             {
+                Panel emptyPanel = new Panel
+                {
+                    Size = new Size(575, 120),
+                    BackColor = Color.FromArgb(28, 29, 33),
+                    Margin = new Padding(0, 0, 0, 10)
+                };
                 Label emptyLbl = new Label
                 {
-                    Text = "No wireless peripherals detected.\nEnsure devices are turned on and connected via Bluetooth or Dongle.",
-                    Size = new Size(460, 60),
-                    ForeColor = Color.FromArgb(160, 160, 160),
-                    TextAlign = ContentAlignment.MiddleCenter
+                    Text = "No wireless peripherals detected.\n\nEnsure your Bluetooth keyboard/mouse or 2.4GHz USB dongle is connected,\nthen click 'Refresh' below.",
+                    Size = new Size(550, 90),
+                    Location = new Point(12, 16),
+                    ForeColor = Color.FromArgb(160, 160, 165),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Segoe UI", 9.5f)
                 };
-                _flpCards.Controls.Add(emptyLbl);
+                emptyPanel.Controls.Add(emptyLbl);
+                _flpCards.Controls.Add(emptyPanel);
             }
             else
             {
+                int cardWidth = _flpCards.ClientSize.Width > 520 ? _flpCards.ClientSize.Width - 10 : 575;
                 foreach (var dev in devices)
                 {
                     Panel card = new Panel
                     {
-                        Size = new Size(455, 95),
-                        BackColor = Color.FromArgb(38, 38, 42),
-                        BorderStyle = BorderStyle.FixedSingle,
-                        Margin = new Padding(3, 4, 3, 6)
+                        Size = new Size(cardWidth, 130),
+                        BackColor = Color.FromArgb(28, 29, 33),
+                        Margin = new Padding(0, 0, 0, 12),
+                        Padding = new Padding(14, 10, 14, 10)
                     };
-
-                    string iconPrefix = dev.Category == DeviceCategory.Keyboard ? "⌨ " :
-                                        dev.Category == DeviceCategory.Mouse ? "🖱 " :
-                                        dev.Category == DeviceCategory.Headset ? "🎧 " : "🔋 ";
-
-                    string isPrimary = (dev == kb || dev == mouse) ? "  [★ System Tray]" : "";
-
-                    Label lblName = new Label
+                    card.Paint += delegate(object s, PaintEventArgs e)
                     {
-                        Text = iconPrefix + dev.Name + isPrimary,
-                        Location = new Point(12, 10),
-                        Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-                        AutoSize = true,
-                        ForeColor = (dev == kb || dev == mouse) ? Color.White : Color.FromArgb(220, 220, 220)
+                        using (Pen p = new Pen(Color.FromArgb(50, 52, 60), 1f))
+                        {
+                            e.Graphics.DrawRectangle(p, 0, 0, card.Width - 1, card.Height - 1);
+                        }
                     };
 
-                    Color pctColor = GetColorForPercentage(dev.BatteryPercentage);
+                    // ZONE A: Right Column Dedicated Battery Box
+                    Panel pnlPct = new Panel
+                    {
+                        Location = new Point(card.Width - 120, 10),
+                        Size = new Size(106, 44),
+                        BackColor = Color.FromArgb(22, 23, 27)
+                    };
+                    pnlPct.Paint += delegate(object s, PaintEventArgs e)
+                    {
+                        using (Pen p = new Pen(Color.FromArgb(45, 47, 55), 1f))
+                        {
+                            e.Graphics.DrawRectangle(p, 0, 0, pnlPct.Width - 1, pnlPct.Height - 1);
+                        }
+                    };
+
+                    int pct = dev.BatteryPercentage;
+                    bool connected = dev.IsConnected;
+                    string pctText = dev.GetDisplayPercentage();
+                    if (dev.IsSleeping) pctText = pct >= 0 ? (pct + "%") : "Standby";
+                    else if (!connected) pctText = pct >= 0 ? (pct + "%") : "Offline";
+
+                    Color pctColor = GetColorForPercentage(pct, connected);
+
                     Label lblPct = new Label
                     {
-                        Text = dev.GetDisplayPercentage(),
-                        Location = new Point(370, 8),
-                        Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-                        AutoSize = true,
-                        ForeColor = pctColor
+                        Text = pctText,
+                        Font = new Font("Segoe UI", 15f, FontStyle.Bold),
+                        ForeColor = pctColor,
+                        Dock = DockStyle.Fill,
+                        TextAlign = ContentAlignment.MiddleCenter
                     };
+                    pnlPct.Controls.Add(lblPct);
+                    card.Controls.Add(pnlPct);
 
-                    ProgressBar pb = new ProgressBar
+                    // ZONE B: Left Header Area (Guaranteed not to touch Zone A)
+                    Label lblName = new Label
                     {
-                        Location = new Point(14, 38),
-                        Size = new Size(425, 18),
-                        Maximum = 100,
-                        Minimum = 0,
-                        Value = Math.Max(0, Math.Min(100, dev.BatteryPercentage >= 0 ? dev.BatteryPercentage : 0))
+                        Text = dev.Name,
+                        Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                        ForeColor = Color.FromArgb(245, 245, 247),
+                        Location = new Point(14, 12),
+                        MaximumSize = new Size(card.Width - 145, 22),
+                        AutoEllipsis = true,
+                        AutoSize = true
                     };
-
-                    Label lblDetails = new Label
-                    {
-                        Text = string.Format("Connection: {0} | Protocol: {1} | Status: {2}",
-                            dev.ConnectionType, dev.Protocol ?? "Standard", dev.StatusMessage ?? "Online"),
-                        Location = new Point(12, 63),
-                        Font = new Font("Segoe UI", 8.5f),
-                        AutoSize = true,
-                        ForeColor = Color.FromArgb(170, 170, 170)
-                    };
-
                     card.Controls.Add(lblName);
-                    card.Controls.Add(lblPct);
-                    card.Controls.Add(pb);
-                    card.Controls.Add(lblDetails);
+
+                    // Primary Tag (Row 2, Below device name to prevent horizontal collision)
+                    if (dev == kb || dev == mouse)
+                    {
+                        Label lblTrayTag = new Label
+                        {
+                            Text = dev == kb ? "★ Primary Keyboard" : "★ Primary Mouse",
+                            Font = new Font("Segoe UI", 8f, FontStyle.Bold),
+                            ForeColor = Color.FromArgb(96, 165, 250),
+                            BackColor = Color.FromArgb(30, 45, 75),
+                            Location = new Point(14, lblName.Bottom + 4),
+                            Padding = new Padding(5, 2, 5, 2),
+                            AutoSize = true
+                        };
+                        card.Controls.Add(lblTrayTag);
+                    }
+
+                    // ZONE C: Battery Bar
+                    ModernBatteryBar bar = new ModernBatteryBar(pct, connected)
+                    {
+                        Location = new Point(14, 58),
+                        Width = card.Width - 28
+                    };
+                    card.Controls.Add(bar);
+
+                    // ZONE D: Metadata Lines
+                    string statusStr = !string.IsNullOrEmpty(dev.StatusMessage) ? dev.StatusMessage : (connected ? "Active" : "Offline");
+                    Label lblMeta1 = new Label
+                    {
+                        Text = string.Format("Connection: {0}   •   Status: {1}", dev.ConnectionType, statusStr),
+                        Font = new Font("Segoe UI", 8.5f),
+                        ForeColor = Color.FromArgb(200, 200, 205),
+                        Location = new Point(14, 78),
+                        AutoSize = true
+                    };
+                    card.Controls.Add(lblMeta1);
+
+                    string protoStr = !string.IsNullOrEmpty(dev.Protocol) ? dev.Protocol : "Standard HID";
+                    Label lblMeta2 = new Label
+                    {
+                        Text = string.Format("Protocol: {0}", protoStr),
+                        Font = new Font("Segoe UI", 8f),
+                        ForeColor = Color.FromArgb(140, 140, 148),
+                        Location = new Point(14, 98),
+                        AutoSize = true
+                    };
+                    card.Controls.Add(lblMeta2);
+
                     _flpCards.Controls.Add(card);
                 }
             }
@@ -2359,12 +2633,13 @@ namespace UniversalPeripheralBatteryMonitor
             _lblStatus.Text = "Last updated: " + DateTime.Now.ToString("HH:mm:ss");
         }
 
-        private Color GetColorForPercentage(int pct)
+        private Color GetColorForPercentage(int pct, bool connected)
         {
+            if (!connected && pct < 0) return Color.FromArgb(156, 163, 175); // Gray
             if (pct >= 50) return Color.FromArgb(34, 197, 94); // Green
             if (pct >= 20) return Color.FromArgb(245, 158, 11); // Amber
             if (pct >= 0) return Color.FromArgb(239, 68, 68); // Red
-            return Color.FromArgb(140, 140, 140);
+            return Color.FromArgb(156, 163, 175); // Gray
         }
     }
 }
