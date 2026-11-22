@@ -42,10 +42,13 @@ A lightweight, zero-dependency Windows system tray utility that displays live ba
    - View all discovered wireless peripherals at a glance, along with connection type (Bluetooth, 2.4G Dongle, USB), battery percentage, status, and device ID.
 
 ---
+<img width="315" height="280" alt="image" src="https://github.com/user-attachments/assets/b1a15d87-6bad-4785-a3ad-ce932416ce07" />
+<img width="388" height="176" alt="image" src="https://github.com/user-attachments/assets/50cdbed7-7ac3-40e6-b34b-557b7f0fcf4c" />
+<img width="317" height="302" alt="image" src="https://github.com/user-attachments/assets/677bc8d0-d0ad-44d6-9b7d-61dca1180618" />
+<img width="100" height="62" alt="image" src="https://github.com/user-attachments/assets/dcfd9527-9bef-4dc7-bf63-5a9517f9f32e" />
 
-<img width="263" height="235" alt="image" src="https://github.com/user-attachments/assets/d6ff33d7-94c2-4ae9-8794-2189f92cf279" />
-<img width="336" height="174" alt="image" src="https://github.com/user-attachments/assets/f2908049-4fb2-41ec-a5a1-5e76f958ec0e" />
-<img width="201" height="114" alt="image" src="https://github.com/user-attachments/assets/3d12acf9-5d39-401e-9d70-8229768eac80" />
+
+
 
 
 
