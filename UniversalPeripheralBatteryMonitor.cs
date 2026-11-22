@@ -1085,25 +1085,314 @@ namespace UniversalPeripheralBatteryMonitor
         static extern IntPtr CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, ref OVERLAPPED lpOverlapped);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, ref OVERLAPPED lpOverlapped);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool GetOverlappedResult(IntPtr hFile, ref OVERLAPPED lpOverlapped, out uint lpNumberOfBytesTransferred, bool bWait);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
         static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string lpName);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool CancelIo(IntPtr hFile);
+        static extern bool CloseHandle(IntPtr hObject);
+
+        // ====================================================================
+        //  HARDENED HID I/O LAYER
+        //
+        //  Goals of this layer:
+        //   1. Memory safety: every overlapped ReadFile/WriteFile/DeviceIoControl
+        //      uses unmanaged, address-stable buffers + OVERLAPPED structs, and
+        //      that memory is never freed until the kernel has confirmed it is
+        //      finished with it (completion or confirmed cancellation).
+        //   2. Least privilege: every HID interface is first opened with ZERO
+        //      access just to read VID/PID/usage/report lengths. Only interfaces
+        //      that match a known protocol are re-opened, and only with the access
+        //      they actually need (generic battery scan = read-only, never write).
+        //   3. No unbounded blocking: HidD_GetFeature (no timeout) is replaced by
+        //      an overlapped IOCTL with a timeout and confirmed cancellation.
+        // ====================================================================
+
+        const uint ACCESS_NONE = 0;
+        const uint GENERIC_READ = 0x80000000;
+        const uint GENERIC_WRITE = 0x40000000;
+        const uint FILE_SHARE_READ_WRITE = 3;
+        const uint OPEN_EXISTING = 3;
+        const uint FILE_FLAG_OVERLAPPED = 0x40000000;
+        const uint IOCTL_HID_GET_FEATURE = 0xB0192;
+        const int HIDP_STATUS_SUCCESS = 0x00110000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct HIDD_ATTRIBUTES
+        {
+            public uint Size;
+            public ushort VendorID;
+            public ushort ProductID;
+            public ushort VersionNumber;
+        }
+
+        [DllImport("hid.dll", SetLastError = true)]
+        static extern bool HidD_GetAttributes(IntPtr HidDeviceObject, ref HIDD_ATTRIBUTES Attributes);
+
+        // Overlapped I/O always goes through unmanaged pointers (see HidOp).
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "ReadFile")]
+        static extern bool ReadFileOv(IntPtr hFile, IntPtr lpBuffer, uint nNumberOfBytesToRead, IntPtr lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "WriteFile")]
+        static extern bool WriteFileOv(IntPtr hFile, IntPtr lpBuffer, uint nNumberOfBytesToWrite, IntPtr lpNumberOfBytesWritten, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "GetOverlappedResult")]
+        static extern bool GetOverlappedResultOv(IntPtr hFile, IntPtr lpOverlapped, out uint lpNumberOfBytesTransferred, bool bWait);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool CloseHandle(IntPtr hObject);
+        static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(IntPtr hDevice, uint dwIoControlCode, IntPtr lpInBuffer, uint nInBufferSize, IntPtr lpOutBuffer, uint nOutBufferSize, IntPtr lpBytesReturned, IntPtr lpOverlapped);
+
+        private static bool IsValidHandle(IntPtr h)
+        {
+            return h != IntPtr.Zero && h.ToInt64() != -1;
+        }
+
+        private static IntPtr OpenHid(string path, uint access)
+        {
+            return CreateFile(path, access, FILE_SHARE_READ_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+        }
+
+        /// <summary>Immutable description of one HID interface, gathered once per scan with a zero-access handle.</summary>
+        private sealed class HidEntry
+        {
+            public string DevicePath;
+            public ushort Vid, Pid;
+            public ushort UsagePage, Usage;
+            public ushort InLen, OutLen, FeatLen;
+        }
+
+        /// <summary>
+        /// One in-flight overlapped operation. Owns an unmanaged OVERLAPPED, buffer and event.
+        /// The memory is only released once the kernel is provably done with it; if a cancel
+        /// cannot be confirmed, the memory is intentionally leaked (a few bytes) rather than
+        /// freed under a pending I/O request, which would corrupt the heap.
+        /// </summary>
+        private sealed class HidOp : IDisposable
+        {
+            private const int ERROR_IO_PENDING = 997;
+            private readonly IntPtr _dev;
+            private readonly int _len;
+            private IntPtr _ov, _buf, _evt;
+            private bool _inFlight;
+
+            public HidOp(IntPtr device, int length)
+            {
+                if (length <= 0 || length > 65535) throw new ArgumentOutOfRangeException("length");
+                _dev = device;
+                _len = length;
+                _evt = CreateEvent(IntPtr.Zero, true, false, null);
+                if (_evt == IntPtr.Zero) throw new InvalidOperationException("CreateEvent failed");
+                _ov = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(OVERLAPPED)));
+                _buf = Marshal.AllocHGlobal(length);
+                ResetState();
+            }
+
+            private void ResetState()
+            {
+                OVERLAPPED o = new OVERLAPPED();
+                o.hEvent = _evt;
+                Marshal.StructureToPtr(o, _ov, false);
+                Marshal.Copy(new byte[_len], 0, _buf, _len);
+            }
+
+            private bool Begin(bool completedSynchronously)
+            {
+                if (completedSynchronously) { _inFlight = true; return true; }   // event is still signaled; harvested in Wait()
+                _inFlight = Marshal.GetLastWin32Error() == ERROR_IO_PENDING;
+                return _inFlight;
+            }
+
+            public bool StartRead()
+            {
+                if (_inFlight) return false;
+                ResetState();
+                return Begin(ReadFileOv(_dev, _buf, (uint)_len, IntPtr.Zero, _ov));
+            }
+
+            public bool StartWrite(byte[] data)
+            {
+                if (_inFlight || data == null || data.Length == 0) return false;
+                ResetState();
+                int n = Math.Min(data.Length, _len);
+                Marshal.Copy(data, 0, _buf, n);
+                return Begin(WriteFileOv(_dev, _buf, (uint)n, IntPtr.Zero, _ov));
+            }
+
+            /// <summary>Feature report read via overlapped IOCTL (what HidD_GetFeature does, but cancellable).</summary>
+            public bool StartGetFeature(byte reportId)
+            {
+                if (_inFlight) return false;
+                ResetState();
+                Marshal.WriteByte(_buf, reportId);
+                return Begin(DeviceIoControl(_dev, IOCTL_HID_GET_FEATURE, _buf, (uint)_len, _buf, (uint)_len, IntPtr.Zero, _ov));
+            }
+
+            /// <summary>Returns bytes transferred, or -1 on timeout/failure (the operation is cancelled and confirmed dead first).</summary>
+            public int Wait(uint timeoutMs)
+            {
+                if (!_inFlight) return -1;
+                if (WaitForSingleObject(_evt, timeoutMs) == 0)
+                {
+                    uint n;
+                    bool ok = GetOverlappedResultOv(_dev, _ov, out n, false);
+                    _inFlight = false;
+                    return ok ? (int)n : -1;
+                }
+                Cancel();
+                return -1;
+            }
+
+            private void Cancel()
+            {
+                if (!_inFlight) return;
+                CancelIoEx(_dev, _ov);
+                // A cancelled request still completes and signals the event: wait for that
+                // so we know the kernel will not touch our memory again.
+                if (WaitForSingleObject(_evt, 2000) == 0)
+                {
+                    uint n;
+                    GetOverlappedResultOv(_dev, _ov, out n, false);
+                    _inFlight = false;
+                }
+            }
+
+            public byte[] Data(int count)
+            {
+                count = Math.Max(0, Math.Min(count, _len));
+                byte[] r = new byte[count];
+                if (count > 0) Marshal.Copy(_buf, r, 0, count);
+                return r;
+            }
+
+            public void Dispose()
+            {
+                Cancel();
+                if (_inFlight) return;   // cancel not confirmed: leak instead of risking heap corruption
+                if (_buf != IntPtr.Zero) { Marshal.FreeHGlobal(_buf); _buf = IntPtr.Zero; }
+                if (_ov != IntPtr.Zero) { Marshal.FreeHGlobal(_ov); _ov = IntPtr.Zero; }
+                if (_evt != IntPtr.Zero) { CloseHandle(_evt); _evt = IntPtr.Zero; }
+            }
+        }
+
+        /// <summary>
+        /// Sends one output report and returns the first input report that satisfies 'accept',
+        /// or null on timeout. Unrelated input reports (e.g. async notifications) are skipped
+        /// instead of being mistaken for the reply.
+        /// </summary>
+        private static byte[] HidTransact(IntPtr dev, byte[] outReport, int inLen, uint writeTimeoutMs, uint replyTimeoutMs, bool alsoSetOutputReport, Func<byte[], bool> accept)
+        {
+            using (HidOp rd = new HidOp(dev, inLen))
+            using (HidOp wr = new HidOp(dev, outReport.Length))
+            {
+                if (!rd.StartRead()) return null;
+                if (!wr.StartWrite(outReport)) return null;
+                wr.Wait(writeTimeoutMs);   // outcome ignored; Wait() guarantees the write is finished or cancelled
+                if (alsoSetOutputReport) HidD_SetOutputReport(dev, outReport, (uint)outReport.Length);
+
+                System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+                while (true)
+                {
+                    long remaining = (long)replyTimeoutMs - sw.ElapsedMilliseconds;
+                    if (remaining <= 0) return null;
+                    int n = rd.Wait((uint)remaining);
+                    if (n < 0) return null;
+                    byte[] data = rd.Data(n);
+                    if (accept(data)) return data;
+                    if (!rd.StartRead()) return null;
+                }
+            }
+        }
+
+        private static List<string> EnumerateHidPaths()
+        {
+            List<string> paths = new List<string>();
+            Guid hidGuid = GUID_DEVINTERFACE_HID;
+            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
+            if (!IsValidHandle(hDevInfo)) return paths;
+
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
+                ifData.cbSize = Marshal.SizeOf(ifData);
+                uint index = 0;
+
+                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                {
+                    uint reqSize = 0;
+                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
+                    if (reqSize == 0) continue;
+
+                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
+                    try   // FreeHGlobal is now in a finally: no leak if anything below throws
+                    {
+                        Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+                        if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                        {
+                            string path = Marshal.PtrToStringAuto(new IntPtr(pDetail.ToInt64() + 4));
+                            if (!string.IsNullOrEmpty(path)) paths.Add(path);
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(pDetail);
+                    }
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(hDevInfo);
+            }
+            return paths;
+        }
+
+        /// <summary>Enumerates every HID interface ONCE and probes it with a zero-access handle (no read/write rights requested).</summary>
+        private static List<HidEntry> BuildHidInventory()
+        {
+            List<HidEntry> inventory = new List<HidEntry>();
+            foreach (string path in EnumerateHidPaths())
+            {
+                IntPtr h = CreateFile(path, ACCESS_NONE, FILE_SHARE_READ_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                if (!IsValidHandle(h)) continue;
+                try
+                {
+                    HIDD_ATTRIBUTES attr = new HIDD_ATTRIBUTES();
+                    attr.Size = (uint)Marshal.SizeOf(typeof(HIDD_ATTRIBUTES));
+                    if (!HidD_GetAttributes(h, ref attr)) continue;
+
+                    IntPtr pre;
+                    if (!HidD_GetPreparsedData(h, out pre)) continue;
+                    try
+                    {
+                        HIDP_CAPS caps;
+                        if (HidP_GetCaps(pre, out caps) != HIDP_STATUS_SUCCESS) continue;
+
+                        HidEntry e = new HidEntry();
+                        e.DevicePath = path;
+                        e.Vid = attr.VendorID;
+                        e.Pid = attr.ProductID;
+                        e.UsagePage = caps.UsagePage;
+                        e.Usage = caps.Usage;
+                        e.InLen = caps.InputReportByteLength;
+                        e.OutLen = caps.OutputReportByteLength;
+                        e.FeatLen = caps.FeatureReportByteLength;
+                        inventory.Add(e);
+                    }
+                    finally
+                    {
+                        HidD_FreePreparsedData(pre);
+                    }
+                }
+                finally
+                {
+                    CloseHandle(h);
+                }
+            }
+            return inventory;
+        }
 
         public static List<PeripheralDevice> ScanAllPeripherals(AppSettings settings)
         {
@@ -1113,22 +1402,25 @@ namespace UniversalPeripheralBatteryMonitor
             // 1. Scan PnP Devices (Bluetooth LE, Windows native battery properties)
             ScanPnpDevices(list, seen);
 
+            // One enumeration + zero-access probe shared by all HID scanners
+            List<HidEntry> hid = BuildHidInventory();
+
             // 2. Scan Keychron proprietary dongles (VID 0x3434)
-            ScanKeychronDevices(list, seen);
+            ScanKeychronDevices(list, seen, hid);
 
             // 3. Scan Logitech HID++ dongles (VID 0x046D)
-            ScanLogitechDevices(list, seen);
+            ScanLogitechDevices(list, seen, hid);
 
             // 4. Scan Razer wireless dongles (VID 0x1532)
-            ScanRazerDevices(list, seen);
+            ScanRazerDevices(list, seen, hid);
 
             // 5. Scan Generic HID standard battery page (UsagePage 0x85)
-            ScanGenericHidBatteryDevices(list, seen);
+            ScanGenericHidBatteryDevices(list, seen, hid);
 
             // 6. Scan custom configured devices
             if (settings != null && settings.CustomDevices != null)
             {
-                ScanCustomDevices(list, seen, settings.CustomDevices);
+                ScanCustomDevices(list, seen, settings.CustomDevices, hid);
             }
 
             return list;
@@ -1194,612 +1486,285 @@ namespace UniversalPeripheralBatteryMonitor
             }
         }
 
-        private static void ScanKeychronDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        private static void ScanKeychronDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<HidEntry> hid)
         {
-            Guid hidGuid = GUID_DEVINTERFACE_HID;
-            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
-            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+            // Keychron 2.4G dongle: vendor usage page 0xFFC1, 64-byte reports (VID 0x3434).
+            // Interfaces are pre-filtered from the zero-access inventory, so nothing else is ever opened read/write.
+            const string devId = "keychron:dongle";
 
-            try
+            foreach (HidEntry e in hid)
             {
-                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
-                ifData.cbSize = Marshal.SizeOf(ifData);
-                uint index = 0;
+                if (seen.ContainsKey(devId)) return;
+                if (e.Vid != 0x3434 || e.UsagePage != 0xFFC1 || e.OutLen != 64 || e.InLen != 64) continue;
 
-                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                IntPtr hDev = OpenHid(e.DevicePath, GENERIC_READ | GENERIC_WRITE);
+                if (!IsValidHandle(hDev)) continue;
+
+                try
                 {
-                    uint reqSize = 0;
-                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
-                    if (reqSize == 0) continue;
+                    byte[] outReport = new byte[64];
+                    outReport[0] = 0xB3;
+                    outReport[1] = 0x06;
 
-                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
-                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+                    // Original behaviour preserved: interrupt write + HidD_SetOutputReport, then wait up to 2.5 s for a 0xB4 reply.
+                    byte[] resp = HidTransact(hDev, outReport, 64, 500, 2500, true,
+                        d => d.Length >= 21 && d[0] == 0xB4 && d[20] <= 100);
 
-                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    PeripheralDevice dev = new PeripheralDevice();
+                    dev.Id = devId;
+                    dev.Name = "Keychron M6 Wireless Mouse";
+                    dev.Category = DeviceCategory.Mouse;
+                    dev.ConnectionType = "2.4GHz Dongle (Keychron Link)";
+                    dev.HardwarePath = e.DevicePath;
+                    dev.Protocol = "Keychron 0xFFC1 (0xB3/0xB4)";
+
+                    if (resp != null)
                     {
-                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
-
-                        if (path.IndexOf("vid_3434", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000 /* FILE_FLAG_OVERLAPPED */, IntPtr.Zero);
-                            if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
-                            {
-                                try
-                                {
-                                    IntPtr pPre = IntPtr.Zero;
-                                    if (HidD_GetPreparsedData(hDev, out pPre))
-                                    {
-                                        HIDP_CAPS caps;
-                                        HidP_GetCaps(pPre, out caps);
-                                        HidD_FreePreparsedData(pPre);
-
-                                        if (caps.UsagePage == 0xFFC1 && caps.OutputReportByteLength == 64 && caps.InputReportByteLength == 64)
-                                        {
-                                            IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
-                                            IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
-
-                                            try
-                                            {
-                                                OVERLAPPED ovR = new OVERLAPPED();
-                                                ovR.hEvent = hReadEv;
-                                                byte[] inReport = new byte[64];
-                                                uint readBytes = 0;
-
-                                                ReadFile(hDev, inReport, 64, out readBytes, ref ovR);
-
-                                                byte[] outReport = new byte[64];
-                                                outReport[0] = 0xB3;
-                                                outReport[1] = 0x06;
-
-                                                OVERLAPPED ovW = new OVERLAPPED();
-                                                ovW.hEvent = hWriteEv;
-                                                uint written = 0;
-                                                WriteFile(hDev, outReport, 64, out written, ref ovW);
-                                                WaitForSingleObject(hWriteEv, 500);
-
-                                                HidD_SetOutputReport(hDev, outReport, 64);
-
-                                                uint waitRes = WaitForSingleObject(hReadEv, 2500);
-                                                string devId = "keychron:dongle";
-                                                if (!seen.ContainsKey(devId))
-                                                {
-                                                    seen[devId] = true;
-                                                    PeripheralDevice dev = new PeripheralDevice();
-                                                    dev.Id = devId;
-                                                    dev.Name = "Keychron M6 Wireless Mouse";
-                                                    dev.Category = DeviceCategory.Mouse;
-                                                    dev.ConnectionType = "2.4GHz Dongle (Keychron Link)";
-                                                    dev.HardwarePath = path;
-                                                    dev.Protocol = "Keychron 0xFFC1 (0xB3/0xB4)";
-
-                                                    if (waitRes == 0)
-                                                    {
-                                                        GetOverlappedResult(hDev, ref ovR, out readBytes, false);
-                                                        if (readBytes >= 21 && inReport[0] == 0xB4)
-                                                        {
-                                                            int pct = inReport[20];
-                                                            if (pct >= 0 && pct <= 100)
-                                                            {
-                                                                dev.BatteryPercentage = pct;
-                                                                dev.IsConnected = true;
-                                                                dev.StatusMessage = "Active - " + pct + "%";
-                                                            }
-                                                        }
-                                                    }
-                                                    else
-                                                    {
-                                                        dev.BatteryPercentage = -1;
-                                                        dev.IsConnected = false;
-                                                        dev.IsSleeping = true;
-                                                        dev.StatusMessage = "Standby (Move mouse to wake)";
-                                                    }
-                                                    list.Add(dev);
-                                                }
-                                            }
-                                            finally
-                                            {
-                                                CancelIo(hDev);
-                                                CloseHandle(hReadEv);
-                                                CloseHandle(hWriteEv);
-                                            }
-                                        }
-                                    }
-                                }
-                                finally
-                                {
-                                    CloseHandle(hDev);
-                                }
-                            }
-                        }
+                        int pct = resp[20];
+                        dev.BatteryPercentage = pct;
+                        dev.IsConnected = true;
+                        dev.StatusMessage = "Active - " + pct + "%";
                     }
-                    Marshal.FreeHGlobal(pDetail);
+                    else
+                    {
+                        dev.BatteryPercentage = -1;
+                        dev.IsConnected = false;
+                        dev.IsSleeping = true;
+                        dev.StatusMessage = "Standby (Move mouse to wake)";
+                    }
+                    seen[devId] = true;
+                    list.Add(dev);
                 }
-            }
-            finally
-            {
-                SetupDiDestroyDeviceInfoList(hDevInfo);
+                finally
+                {
+                    CloseHandle(hDev);
+                }
             }
         }
 
-        private static void ScanLogitechDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        private static void ScanLogitechDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<HidEntry> hid)
         {
-            // Logitech HID++ auto-detection (Unifying, Lightspeed, Bolt receivers)
-            Guid hidGuid = GUID_DEVINTERFACE_HID;
-            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
-            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
-
-            try
+            // Logitech HID++ over Unifying / Lightspeed / Bolt receivers (VID 0x046D).
+            // Only vendor-defined collections (usage page >= 0xFF00) are opened for writing;
+            // standard keyboard/mouse/consumer collections are never touched.
+            foreach (HidEntry e in hid)
             {
-                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
-                ifData.cbSize = Marshal.SizeOf(ifData);
-                uint index = 0;
+                if (e.Vid != 0x046D || e.UsagePage < 0xFF00 || e.OutLen < 7 || e.InLen < 7) continue;
 
-                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                IntPtr hDev = OpenHid(e.DevicePath, GENERIC_READ | GENERIC_WRITE);
+                if (!IsValidHandle(hDev)) continue;
+
+                try
                 {
-                    uint reqSize = 0;
-                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
-                    if (reqSize == 0) continue;
-
-                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
-                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
-
-                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    for (byte devIndex = 1; devIndex <= 4; devIndex++)
                     {
-                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+                        string devId = "logitech:" + devIndex;
+                        if (seen.ContainsKey(devId)) continue;
 
-                        if (path.IndexOf("vid_046d", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
-                            if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
-                            {
-                                try
-                                {
-                                    IntPtr pPre = IntPtr.Zero;
-                                    if (HidD_GetPreparsedData(hDev, out pPre))
-                                    {
-                                        HIDP_CAPS caps;
-                                        HidP_GetCaps(pPre, out caps);
-                                        HidD_FreePreparsedData(pPre);
+                        // HID++ 1.0 register read (0x81) of register 0x07 (battery): 0x10 <idx> 0x81 0x07 0 0 0
+                        byte[] outReport = new byte[e.OutLen];
+                        outReport[0] = 0x10;
+                        outReport[1] = devIndex;
+                        outReport[2] = 0x81;
+                        outReport[3] = 0x07;
 
-                                        // Logitech HID++ communication typically uses short (7 bytes) or long (20 bytes) reports
-                                        if (caps.OutputReportByteLength >= 7 && caps.InputReportByteLength >= 7)
-                                        {
-                                            // Query device index 1 through 4 on the receiver
-                                            for (byte devIndex = 1; devIndex <= 4; devIndex++)
-                                            {
-                                                IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
-                                                IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
+                        byte idx = devIndex;
+                        // Accept only the matching register reply; HID++ error replies (sub-id 0x8F) and unrelated
+                        // notifications are skipped instead of being decoded as a battery level.
+                        byte[] resp = HidTransact(hDev, outReport, e.InLen, 200, 300, false,
+                            d => d.Length >= 7 && d[0] == 0x10 && d[1] == idx && d[2] == 0x81 && d[3] == 0x07);
+                        if (resp == null) continue;
 
-                                                try
-                                                {
-                                                    OVERLAPPED ovR = new OVERLAPPED();
-                                                    ovR.hEvent = hReadEv;
-                                                    byte[] inReport = new byte[caps.InputReportByteLength];
-                                                    uint readBytes = 0;
+                        int rawLevel = resp[4];
+                        int pct = -1;
+                        if (rawLevel <= 100) pct = rawLevel;
+                        else if (rawLevel == 0x10) pct = 100;
+                        else if (rawLevel == 0x20) pct = 50;
+                        else if (rawLevel == 0x40) pct = 20;
+                        else if (rawLevel == 0x80) pct = 5;
+                        if (pct < 0) continue;
 
-                                                    ReadFile(hDev, inReport, (uint)inReport.Length, out readBytes, ref ovR);
-
-                                                    // Send HID++ 1.0 Battery Register Read (0x07): 0x10 <devIndex> 0x81 0x07 0x00 0x00 0x00
-                                                    byte[] outReport = new byte[caps.OutputReportByteLength];
-                                                    outReport[0] = 0x10;
-                                                    outReport[1] = devIndex;
-                                                    outReport[2] = 0x81;
-                                                    outReport[3] = 0x07;
-
-                                                    OVERLAPPED ovW = new OVERLAPPED();
-                                                    ovW.hEvent = hWriteEv;
-                                                    uint written = 0;
-                                                    WriteFile(hDev, outReport, (uint)outReport.Length, out written, ref ovW);
-                                                    WaitForSingleObject(hWriteEv, 200);
-
-                                                    uint waitRes = WaitForSingleObject(hReadEv, 300);
-                                                    if (waitRes == 0)
-                                                    {
-                                                        GetOverlappedResult(hDev, ref ovR, out readBytes, false);
-                                                        if (readBytes >= 7 && inReport[0] == 0x10 && inReport[1] == devIndex)
-                                                        {
-                                                            int rawLevel = inReport[4];
-                                                            int pct = -1;
-                                                            if (rawLevel <= 100) pct = rawLevel;
-                                                            else if (rawLevel == 0x10) pct = 100;
-                                                            else if (rawLevel == 0x20) pct = 50;
-                                                            else if (rawLevel == 0x40) pct = 20;
-                                                            else if (rawLevel == 0x80) pct = 5;
-
-                                                            if (pct >= 0)
-                                                            {
-                                                                string devId = "logitech:" + devIndex;
-                                                                if (!seen.ContainsKey(devId))
-                                                                {
-                                                                    seen[devId] = true;
-                                                                    PeripheralDevice dev = new PeripheralDevice();
-                                                                    dev.Id = devId;
-                                                                    dev.Name = string.Format("Logitech Device #{0}", devIndex);
-                                                                    dev.BatteryPercentage = pct;
-                                                                    dev.IsConnected = true;
-                                                                    dev.ConnectionType = "Logitech Unifying/Lightspeed";
-                                                                    dev.Protocol = "Logitech HID++";
-                                                                    dev.Category = devIndex == 1 ? DeviceCategory.Mouse : DeviceCategory.Keyboard;
-                                                                    dev.StatusMessage = "Active - " + pct + "%";
-                                                                    list.Add(dev);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    else
-                                                    {
-                                                        CancelIo(hDev);
-                                                    }
-                                                }
-                                                finally
-                                                {
-                                                    CancelIo(hDev);
-                                                    CloseHandle(hReadEv);
-                                                    CloseHandle(hWriteEv);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                finally
-                                {
-                                    CloseHandle(hDev);
-                                }
-                            }
-                        }
+                        seen[devId] = true;
+                        PeripheralDevice dev = new PeripheralDevice();
+                        dev.Id = devId;
+                        dev.Name = string.Format("Logitech Device #{0}", devIndex);
+                        dev.BatteryPercentage = pct;
+                        dev.IsConnected = true;
+                        dev.ConnectionType = "Logitech Unifying/Lightspeed";
+                        dev.Protocol = "Logitech HID++";
+                        dev.HardwarePath = e.DevicePath;
+                        dev.Category = devIndex == 1 ? DeviceCategory.Mouse : DeviceCategory.Keyboard;
+                        dev.StatusMessage = "Active - " + pct + "%";
+                        list.Add(dev);
                     }
-                    Marshal.FreeHGlobal(pDetail);
                 }
-            }
-            finally
-            {
-                SetupDiDestroyDeviceInfoList(hDevInfo);
+                finally
+                {
+                    CloseHandle(hDev);
+                }
             }
         }
 
-        private static void ScanRazerDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        private static void ScanRazerDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<HidEntry> hid)
         {
-            // Razer HyperSpeed 2.4GHz Dongles (VID 0x1532)
-            Guid hidGuid = GUID_DEVINTERFACE_HID;
-            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
-            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
+            // Razer HyperSpeed 2.4GHz dongles (VID 0x1532), 90-byte status reports.
+            const string devId = "razer:wireless";
 
-            try
+            foreach (HidEntry e in hid)
             {
-                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
-                ifData.cbSize = Marshal.SizeOf(ifData);
-                uint index = 0;
+                if (seen.ContainsKey(devId)) return;
+                if (e.Vid != 0x1532 || e.OutLen < 90 || e.InLen < 90) continue;
 
-                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                IntPtr hDev = OpenHid(e.DevicePath, GENERIC_READ | GENERIC_WRITE);
+                if (!IsValidHandle(hDev)) continue;
+
+                try
                 {
-                    uint reqSize = 0;
-                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
-                    if (reqSize == 0) continue;
+                    byte[] outReport = new byte[e.OutLen];
+                    outReport[0] = 0x00; // Report ID
+                    outReport[1] = 0x00; // Status
+                    outReport[2] = 0x00; // Transaction ID
+                    outReport[5] = 0x02; // Command Class: Device
+                    outReport[6] = 0x07; // Command ID: Battery
 
-                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
-                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+                    byte[] resp = HidTransact(hDev, outReport, e.InLen, 200, 500, false, d => d.Length >= 10);
+                    if (resp == null) continue;
 
-                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
-                    {
-                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+                    int pct = (int)((resp[9] / 255.0) * 100);
+                    if (pct < 0 || pct > 100) continue;
 
-                        if (path.IndexOf("vid_1532", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
-                            if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
-                            {
-                                try
-                                {
-                                    IntPtr pPre = IntPtr.Zero;
-                                    if (HidD_GetPreparsedData(hDev, out pPre))
-                                    {
-                                        HIDP_CAPS caps;
-                                        HidP_GetCaps(pPre, out caps);
-                                        HidD_FreePreparsedData(pPre);
-
-                                        // Razer status report length is typically 90 bytes
-                                        if (caps.OutputReportByteLength >= 90 && caps.InputReportByteLength >= 90)
-                                        {
-                                            IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
-                                            IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
-
-                                            try
-                                            {
-                                                OVERLAPPED ovR = new OVERLAPPED();
-                                                ovR.hEvent = hReadEv;
-                                                byte[] inReport = new byte[caps.InputReportByteLength];
-                                                uint readBytes = 0;
-
-                                                ReadFile(hDev, inReport, (uint)inReport.Length, out readBytes, ref ovR);
-
-                                                byte[] outReport = new byte[caps.OutputReportByteLength];
-                                                outReport[0] = 0x00; // Report ID
-                                                outReport[1] = 0x00; // Status
-                                                outReport[2] = 0x00; // Transaction ID
-                                                outReport[5] = 0x02; // Command Class: Device
-                                                outReport[6] = 0x07; // Command ID: Battery
-
-                                                OVERLAPPED ovW = new OVERLAPPED();
-                                                ovW.hEvent = hWriteEv;
-                                                uint written = 0;
-                                                WriteFile(hDev, outReport, (uint)outReport.Length, out written, ref ovW);
-                                                WaitForSingleObject(hWriteEv, 200);
-
-                                                uint waitRes = WaitForSingleObject(hReadEv, 500);
-                                                if (waitRes == 0)
-                                                {
-                                                    GetOverlappedResult(hDev, ref ovR, out readBytes, false);
-                                                    if (readBytes >= 10)
-                                                    {
-                                                        int rawVal = inReport[9];
-                                                        int pct = (int)((rawVal / 255.0) * 100);
-                                                        if (pct >= 0 && pct <= 100)
-                                                        {
-                                                            string devId = "razer:wireless";
-                                                            if (!seen.ContainsKey(devId))
-                                                            {
-                                                                seen[devId] = true;
-                                                                PeripheralDevice dev = new PeripheralDevice();
-                                                                dev.Id = devId;
-                                                                dev.Name = "Razer Wireless Mouse/Keyboard";
-                                                                dev.BatteryPercentage = pct;
-                                                                dev.IsConnected = true;
-                                                                dev.ConnectionType = "Razer HyperSpeed 2.4G";
-                                                                dev.Protocol = "Razer HID";
-                                                                dev.Category = DeviceCategory.Mouse;
-                                                                dev.StatusMessage = "Active - " + pct + "%";
-                                                                list.Add(dev);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                else
-                                                {
-                                                    CancelIo(hDev);
-                                                }
-                                            }
-                                            finally
-                                            {
-                                                CloseHandle(hReadEv);
-                                                CloseHandle(hWriteEv);
-                                            }
-                                        }
-                                    }
-                                }
-                                finally
-                                {
-                                    CloseHandle(hDev);
-                                }
-                            }
-                        }
-                    }
-                    Marshal.FreeHGlobal(pDetail);
+                    seen[devId] = true;
+                    PeripheralDevice dev = new PeripheralDevice();
+                    dev.Id = devId;
+                    dev.Name = "Razer Wireless Mouse/Keyboard";
+                    dev.BatteryPercentage = pct;
+                    dev.IsConnected = true;
+                    dev.ConnectionType = "Razer HyperSpeed 2.4G";
+                    dev.Protocol = "Razer HID";
+                    dev.HardwarePath = e.DevicePath;
+                    dev.Category = DeviceCategory.Mouse;
+                    dev.StatusMessage = "Active - " + pct + "%";
+                    list.Add(dev);
                 }
-            }
-            finally
-            {
-                SetupDiDestroyDeviceInfoList(hDevInfo);
+                finally
+                {
+                    CloseHandle(hDev);
+                }
             }
         }
 
-        private static void ScanGenericHidBatteryDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen)
+        private static void ScanGenericHidBatteryDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<HidEntry> hid)
         {
-            // USB-IF Standard HID Battery System (Usage Page 0x85)
-            Guid hidGuid = GUID_DEVINTERFACE_HID;
-            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
-            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
-
-            try
+            // USB-IF Battery System (0x85) / Power Device (0x84) pages.
+            // The inventory pass already identified these by usage page, so only matching interfaces are opened,
+            // and only READ-ONLY (a feature-report read needs no write access).
+            foreach (HidEntry e in hid)
             {
-                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
-                ifData.cbSize = Marshal.SizeOf(ifData);
-                uint index = 0;
+                if (e.UsagePage != 0x85 && e.UsagePage != 0x84) continue;
+                if (e.FeatLen == 0) continue;
 
-                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                string devId = "hid_bat:" + e.DevicePath.ToLower();
+                if (seen.ContainsKey(devId)) continue;
+
+                IntPtr hDev = OpenHid(e.DevicePath, GENERIC_READ);
+                if (!IsValidHandle(hDev)) continue;
+
+                try
                 {
-                    uint reqSize = 0;
-                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
-                    if (reqSize == 0) continue;
-
-                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
-                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
-
-                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    using (HidOp op = new HidOp(hDev, e.FeatLen))
                     {
-                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
+                        // Same layout as HidD_GetFeature (report ID 0 in byte 0), but with a 1 s timeout
+                        // and confirmed cancellation instead of a call that can block forever.
+                        if (!op.StartGetFeature(0)) continue;
+                        if (op.Wait(1000) < 1) continue;
 
-                        IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
-                        if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
-                        {
-                            try
-                            {
-                                IntPtr pPre = IntPtr.Zero;
-                                if (HidD_GetPreparsedData(hDev, out pPre))
-                                {
-                                    HIDP_CAPS caps;
-                                    HidP_GetCaps(pPre, out caps);
-                                    HidD_FreePreparsedData(pPre);
+                        byte[] buf = op.Data(e.FeatLen);
+                        int pct = buf.Length > 1 ? buf[1] : -1;
+                        if (pct < 0 || pct > 100) continue;
 
-                                    // Check if collection uses Battery System (0x85) or Power Device (0x84)
-                                    if (caps.UsagePage == 0x85 || caps.UsagePage == 0x84)
-                                    {
-                                        if (caps.FeatureReportByteLength > 0)
-                                        {
-                                            byte[] featBuf = new byte[caps.FeatureReportByteLength];
-                                            if (HidD_GetFeature(hDev, featBuf, (uint)featBuf.Length))
-                                            {
-                                                // Standard battery capacity is usually at byte index 1 or 2
-                                                int pct = featBuf.Length > 1 ? featBuf[1] : -1;
-                                                if (pct >= 0 && pct <= 100)
-                                                {
-                                                    string devId = "hid_bat:" + path.ToLower();
-                                                    if (!seen.ContainsKey(devId))
-                                                    {
-                                                        seen[devId] = true;
-                                                        PeripheralDevice dev = new PeripheralDevice();
-                                                        dev.Id = devId;
-                                                        dev.Name = "Standard HID Wireless Device";
-                                                        dev.BatteryPercentage = pct;
-                                                        dev.IsConnected = true;
-                                                        dev.ConnectionType = "USB HID Battery System (2.4G)";
-                                                        dev.Protocol = "UsagePage 0x85";
-                                                        dev.Category = CategorizeDevice("", path, "", caps.UsagePage, caps.Usage);
-                                                        dev.StatusMessage = "Active - " + pct + "%";
-                                                        list.Add(dev);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            finally
-                            {
-                                CloseHandle(hDev);
-                            }
-                        }
+                        seen[devId] = true;
+                        PeripheralDevice dev = new PeripheralDevice();
+                        dev.Id = devId;
+                        dev.Name = "Standard HID Wireless Device";
+                        dev.BatteryPercentage = pct;
+                        dev.IsConnected = true;
+                        dev.ConnectionType = "USB HID Battery System (2.4G)";
+                        dev.Protocol = "UsagePage 0x85";
+                        dev.HardwarePath = e.DevicePath;
+                        dev.Category = CategorizeDevice("", e.DevicePath, "", e.UsagePage, e.Usage);
+                        dev.StatusMessage = "Active - " + pct + "%";
+                        list.Add(dev);
                     }
-                    Marshal.FreeHGlobal(pDetail);
                 }
-            }
-            finally
-            {
-                SetupDiDestroyDeviceInfoList(hDevInfo);
+                finally
+                {
+                    CloseHandle(hDev);
+                }
             }
         }
 
-        private static void ScanCustomDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<CustomDeviceConfig> customConfigs)
+        private static void ScanCustomDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<CustomDeviceConfig> customConfigs, List<HidEntry> hid)
         {
             if (customConfigs == null || customConfigs.Count == 0) return;
 
-            Guid hidGuid = GUID_DEVINTERFACE_HID;
-            IntPtr hDevInfo = SetupDiGetClassDevs(ref hidGuid, IntPtr.Zero, IntPtr.Zero, 0x12);
-            if (hDevInfo == IntPtr.Zero || hDevInfo.ToInt64() == -1) return;
-
-            try
+            foreach (CustomDeviceConfig cfg in customConfigs)
             {
-                SP_DEVICE_INTERFACE_DATA ifData = new SP_DEVICE_INTERFACE_DATA();
-                ifData.cbSize = Marshal.SizeOf(ifData);
-                uint index = 0;
+                // Validate config-supplied values before they drive any I/O.
+                if (cfg == null || string.IsNullOrEmpty(cfg.Name)) continue;
+                if (cfg.BatteryByteOffset < 0 || cfg.BatteryByteOffset >= 4096) continue;
 
-                while (SetupDiEnumDeviceInterfaces(hDevInfo, IntPtr.Zero, ref hidGuid, index++, ref ifData))
+                string devId = "custom:" + cfg.Name.ToLower();
+                if (seen.ContainsKey(devId)) continue;
+
+                foreach (HidEntry e in hid)
                 {
-                    uint reqSize = 0;
-                    SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, IntPtr.Zero, 0, ref reqSize, IntPtr.Zero);
-                    if (reqSize == 0) continue;
+                    if (e.Vid != cfg.VendorId || e.Pid != cfg.ProductId) continue;
+                    if (cfg.UsagePage != 0 && e.UsagePage != cfg.UsagePage) continue;
+                    if (e.InLen == 0 || e.OutLen == 0) continue;
+                    if (cfg.BatteryByteOffset >= e.InLen) continue;
 
-                    IntPtr pDetail = Marshal.AllocHGlobal((int)reqSize);
-                    Marshal.WriteInt32(pDetail, IntPtr.Size == 8 ? 8 : 5);
+                    IntPtr hDev = OpenHid(e.DevicePath, GENERIC_READ | GENERIC_WRITE);
+                    if (!IsValidHandle(hDev)) continue;
 
-                    if (SetupDiGetDeviceInterfaceDetail(hDevInfo, ref ifData, pDetail, reqSize, ref reqSize, IntPtr.Zero))
+                    try
                     {
-                        string path = Marshal.PtrToStringAuto((IntPtr)((long)pDetail + 4));
-
-                        foreach (var cfg in customConfigs)
+                        // Exact report lengths from the device's own descriptor (never larger than it declares).
+                        byte[] outReport = new byte[e.OutLen];
+                        outReport[0] = cfg.QueryReportId;
+                        if (cfg.QueryPayload != null)
                         {
-                            string vidStr = string.Format("vid_{0:X4}", cfg.VendorId);
-                            string pidStr = string.Format("pid_{0:X4}", cfg.ProductId);
-
-                            if (path.IndexOf(vidStr, StringComparison.OrdinalIgnoreCase) >= 0 &&
-                                path.IndexOf(pidStr, StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                IntPtr hDev = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
-                                if (hDev != IntPtr.Zero && hDev.ToInt64() != -1)
-                                {
-                                    try
-                                    {
-                                        IntPtr pPre = IntPtr.Zero;
-                                        if (HidD_GetPreparsedData(hDev, out pPre))
-                                        {
-                                            HIDP_CAPS caps;
-                                            HidP_GetCaps(pPre, out caps);
-                                            HidD_FreePreparsedData(pPre);
-
-                                            if (cfg.UsagePage == 0 || caps.UsagePage == cfg.UsagePage)
-                                            {
-                                                IntPtr hReadEv = CreateEvent(IntPtr.Zero, true, false, null);
-                                                IntPtr hWriteEv = CreateEvent(IntPtr.Zero, true, false, null);
-
-                                                try
-                                                {
-                                                    OVERLAPPED ovR = new OVERLAPPED();
-                                                    ovR.hEvent = hReadEv;
-                                                    byte[] inReport = new byte[Math.Max(64, (int)caps.InputReportByteLength)];
-                                                    uint readBytes = 0;
-
-                                                    ReadFile(hDev, inReport, (uint)inReport.Length, out readBytes, ref ovR);
-
-                                                    byte[] outReport = new byte[Math.Max(64, (int)caps.OutputReportByteLength)];
-                                                    outReport[0] = cfg.QueryReportId;
-                                                    if (cfg.QueryPayload != null)
-                                                    {
-                                                        for (int i = 0; i < cfg.QueryPayload.Length && i + 1 < outReport.Length; i++)
-                                                        {
-                                                            outReport[i + 1] = cfg.QueryPayload[i];
-                                                        }
-                                                    }
-
-                                                    OVERLAPPED ovW = new OVERLAPPED();
-                                                    ovW.hEvent = hWriteEv;
-                                                    uint written = 0;
-                                                    WriteFile(hDev, outReport, (uint)outReport.Length, out written, ref ovW);
-                                                    WaitForSingleObject(hWriteEv, 500);
-
-                                                    uint waitRes = WaitForSingleObject(hReadEv, 2000);
-                                                    if (waitRes == 0)
-                                                    {
-                                                        GetOverlappedResult(hDev, ref ovR, out readBytes, false);
-                                                        if (readBytes > cfg.BatteryByteOffset && inReport[0] == cfg.ExpectedResponseReportId)
-                                                        {
-                                                            int pct = inReport[cfg.BatteryByteOffset];
-                                                            if (pct >= 0 && pct <= 100)
-                                                            {
-                                                                string devId = "custom:" + cfg.Name.ToLower();
-                                                                if (!seen.ContainsKey(devId))
-                                                                {
-                                                                    seen[devId] = true;
-                                                                    PeripheralDevice dev = new PeripheralDevice();
-                                                                    dev.Id = devId;
-                                                                    dev.Name = cfg.Name;
-                                                                    dev.BatteryPercentage = pct;
-                                                                    dev.IsConnected = true;
-                                                                    dev.ConnectionType = "Custom 2.4G Receiver";
-                                                                    dev.Protocol = "Custom Query";
-                                                                    dev.Category = cfg.Category;
-                                                                    dev.StatusMessage = "Active - " + pct + "%";
-                                                                    list.Add(dev);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    else
-                                                    {
-                                                        CancelIo(hDev);
-                                                    }
-                                                }
-                                                finally
-                                                {
-                                                    CancelIo(hDev);
-                                                    CloseHandle(hReadEv);
-                                                    CloseHandle(hWriteEv);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    finally
-                                    {
-                                        CloseHandle(hDev);
-                                    }
-                                }
-                            }
+                            for (int i = 0; i < cfg.QueryPayload.Length && i + 1 < outReport.Length; i++)
+                                outReport[i + 1] = cfg.QueryPayload[i];
                         }
+
+                        CustomDeviceConfig c = cfg;
+                        byte[] resp = HidTransact(hDev, outReport, e.InLen, 500, 2000, false,
+                            d => d.Length > c.BatteryByteOffset && d[0] == c.ExpectedResponseReportId);
+                        if (resp == null) continue;
+
+                        int pct = resp[cfg.BatteryByteOffset];
+                        if (pct < 0 || pct > 100) continue;
+
+                        seen[devId] = true;
+                        PeripheralDevice dev = new PeripheralDevice();
+                        dev.Id = devId;
+                        dev.Name = cfg.Name;
+                        dev.BatteryPercentage = pct;
+                        dev.IsConnected = true;
+                        dev.ConnectionType = "Custom 2.4G Receiver";
+                        dev.Protocol = "Custom Query";
+                        dev.HardwarePath = e.DevicePath;
+                        dev.Category = cfg.Category;
+                        dev.StatusMessage = "Active - " + pct + "%";
+                        list.Add(dev);
                     }
-                    Marshal.FreeHGlobal(pDetail);
+                    finally
+                    {
+                        CloseHandle(hDev);
+                    }
+
+                    if (seen.ContainsKey(devId)) break;
                 }
-            }
-            finally
-            {
-                SetupDiDestroyDeviceInfoList(hDevInfo);
             }
         }
 
