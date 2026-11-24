@@ -17,7 +17,12 @@ if not exist "%CSC%" (
 
 taskkill /f /im UniversalPeripheralBatteryMonitor.exe >nul 2>&1
 
-"%CSC%" /nologo /target:winexe /optimize+ /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /out:"%~dp0UniversalPeripheralBatteryMonitor.exe" "%~dp0UniversalPeripheralBatteryMonitor.cs"
+set ICON_FLAG=
+if exist "%~dp0app.ico" (
+    set ICON_FLAG=/win32icon:"%~dp0app.ico"
+)
+
+"%CSC%" /nologo /target:winexe /optimize+ %ICON_FLAG% /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /out:"%~dp0UniversalPeripheralBatteryMonitor.exe" "%~dp0UniversalPeripheralBatteryMonitor.cs"
 
 if %ERRORLEVEL% equ 0 (
     echo [SUCCESS] UniversalPeripheralBatteryMonitor.exe compiled successfully!

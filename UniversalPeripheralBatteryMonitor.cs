@@ -12,9 +12,77 @@ using Microsoft.Win32;
 
 namespace UniversalPeripheralBatteryMonitor
 {
+    public static class AppPaths
+    {
+        private static string _dataDir = null;
+
+        public static string GetDataDirectory()
+        {
+            if (_dataDir != null) return _dataDir;
+            try
+            {
+                // Portable mode: if config.json exists next to exe, use that directory
+                string exeDir = AppDomain.CurrentDomain.BaseDirectory;
+                string localCfg = Path.Combine(exeDir, "config.json");
+                if (File.Exists(localCfg))
+                {
+                    _dataDir = exeDir;
+                    return _dataDir;
+                }
+
+                // Standard Windows per-user AppData directory
+                string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                string target = Path.Combine(appData, "UniversalPeripheralBatteryMonitor");
+                if (!Directory.Exists(target))
+                {
+                    Directory.CreateDirectory(target);
+                }
+                _dataDir = target;
+                return _dataDir;
+            }
+            catch
+            {
+                _dataDir = AppDomain.CurrentDomain.BaseDirectory;
+                return _dataDir;
+            }
+        }
+
+        public static string GetConfigPath()
+        {
+            return Path.Combine(GetDataDirectory(), "config.json");
+        }
+
+        private static Icon _appIcon = null;
+        public static Icon GetAppIcon()
+        {
+            if (_appIcon != null) return _appIcon;
+            try
+            {
+                _appIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch { }
+            return _appIcon;
+        }
+
+        public static void LogError(string filename, string title, Exception ex)
+        {
+            try
+            {
+                string p = Path.Combine(GetDataDirectory(), filename);
+                string errType = ex != null ? ex.GetType().Name : "Unknown";
+                string errMsg = ex != null ? ex.Message : "Unknown error";
+                string trace = ex != null ? ex.StackTrace : "";
+                string entry = string.Format("[{0:yyyy-MM-dd HH:mm:ss}] {1}: ({2}) {3}\r\n{4}\r\n\r\n",
+                    DateTime.Now, title, errType, errMsg, trace);
+                File.AppendAllText(p, entry, Encoding.UTF8);
+            }
+            catch { }
+        }
+    }
+
     static class Program
     {
-        private const string AppGuid = "Global\\UniversalPeripheralBatteryMonitor_AppMutex_v2";
+        private const string AppGuid = "Local\\UniversalPeripheralBatteryMonitor_AppMutex_v2";
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
@@ -30,21 +98,11 @@ namespace UniversalPeripheralBatteryMonitor
 
             AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
             {
-                try
-                {
-                    File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "unhandled.log"),
-                        "UnhandledException:\n" + (e.ExceptionObject != null ? e.ExceptionObject.ToString() : "null"));
-                }
-                catch { }
+                AppPaths.LogError("unhandled.log", "UnhandledException", e.ExceptionObject as Exception);
             };
             Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
             {
-                try
-                {
-                    File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "unhandled.log"),
-                        "ThreadException:\n" + (e.Exception != null ? e.Exception.ToString() : "null"));
-                }
-                catch { }
+                AppPaths.LogError("unhandled.log", "ThreadException", e.Exception);
             };
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
 
@@ -72,12 +130,7 @@ namespace UniversalPeripheralBatteryMonitor
             }
             catch (Exception ex)
             {
-                try
-                {
-                    File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "unhandled.log"),
-                        "Main catch:\n" + ex.ToString());
-                }
-                catch { }
+                AppPaths.LogError("unhandled.log", "Main catch", ex);
             }
         }
     }
@@ -133,28 +186,6 @@ namespace UniversalPeripheralBatteryMonitor
         }
     }
 
-    public class CustomDeviceConfig
-    {
-        public string Name { get; set; }
-        public ushort VendorId { get; set; }
-        public ushort ProductId { get; set; }
-        public ushort UsagePage { get; set; }
-        public byte QueryReportId { get; set; }
-        public byte[] QueryPayload { get; set; }
-        public byte ExpectedResponseReportId { get; set; }
-        public int BatteryByteOffset { get; set; }
-        public DeviceCategory Category { get; set; }
-
-        public CustomDeviceConfig()
-        {
-            Category = DeviceCategory.Mouse;
-            QueryReportId = 0xB3;
-            QueryPayload = new byte[] { 0x06 };
-            ExpectedResponseReportId = 0xB4;
-            BatteryByteOffset = 20;
-        }
-    }
-
     public class AppSettings
     {
         public string PreferredKeyboardId { get; set; }
@@ -162,7 +193,6 @@ namespace UniversalPeripheralBatteryMonitor
         public int PollIntervalSeconds { get; set; }
         public int DisplayMode { get; set; } // 0 = Dual, 1 = KbOnly, 2 = MouseOnly, 3 = Combined, 4 = AllDevices
         public int IconStyle { get; set; } // 0 = Badge+Bar, 1 = LargeNumber, 2 = GaugeOnly
-        public List<CustomDeviceConfig> CustomDevices { get; set; }
 
         public AppSettings()
         {
@@ -171,13 +201,11 @@ namespace UniversalPeripheralBatteryMonitor
             PollIntervalSeconds = 120;
             DisplayMode = 0;
             IconStyle = 0;
-            CustomDevices = new List<CustomDeviceConfig>();
         }
 
         public static string GetConfigPath()
         {
-            string dir = Path.GetDirectoryName(Application.ExecutablePath);
-            return Path.Combine(dir, "config.json");
+            return AppPaths.GetConfigPath();
         }
 
         public static AppSettings Load()
@@ -189,12 +217,11 @@ namespace UniversalPeripheralBatteryMonitor
                 try
                 {
                     string content = File.ReadAllText(path, Encoding.UTF8);
-                    // Simple, zero-dependency key-value parser for basic settings
                     settings.PreferredKeyboardId = ExtractJsonString(content, "PreferredKeyboardId", "auto");
                     settings.PreferredMouseId = ExtractJsonString(content, "PreferredMouseId", "auto");
-                    settings.PollIntervalSeconds = ExtractJsonInt(content, "PollIntervalSeconds", 120);
-                    settings.DisplayMode = ExtractJsonInt(content, "DisplayMode", 0);
-                    settings.IconStyle = ExtractJsonInt(content, "IconStyle", 0);
+                    settings.PollIntervalSeconds = ExtractJsonInt(content, "PollIntervalSeconds", 120, 10, 3600);
+                    settings.DisplayMode = ExtractJsonInt(content, "DisplayMode", 0, 0, 4);
+                    settings.IconStyle = ExtractJsonInt(content, "IconStyle", 0, 0, 2);
                 }
                 catch { }
             }
@@ -213,9 +240,9 @@ namespace UniversalPeripheralBatteryMonitor
                 sb.AppendLine("{");
                 sb.AppendLine("  \"PreferredKeyboardId\": \"" + EscapeJson(PreferredKeyboardId) + "\",");
                 sb.AppendLine("  \"PreferredMouseId\": \"" + EscapeJson(PreferredMouseId) + "\",");
-                sb.AppendLine("  \"PollIntervalSeconds\": " + PollIntervalSeconds + ",");
-                sb.AppendLine("  \"DisplayMode\": " + DisplayMode + ",");
-                sb.AppendLine("  \"IconStyle\": " + IconStyle);
+                sb.AppendLine("  \"PollIntervalSeconds\": " + Math.Min(3600, Math.Max(10, PollIntervalSeconds)) + ",");
+                sb.AppendLine("  \"DisplayMode\": " + Math.Min(4, Math.Max(0, DisplayMode)) + ",");
+                sb.AppendLine("  \"IconStyle\": " + Math.Min(2, Math.Max(0, IconStyle)));
                 sb.AppendLine("}");
                 File.WriteAllText(GetConfigPath(), sb.ToString(), Encoding.UTF8);
             }
@@ -224,8 +251,32 @@ namespace UniversalPeripheralBatteryMonitor
 
         private static string EscapeJson(string s)
         {
-            if (s == null) return "";
+            if (string.IsNullOrEmpty(s)) return "";
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        private static string UnescapeJson(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            StringBuilder sb = new StringBuilder(s.Length);
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] == '\\' && i + 1 < s.Length)
+                {
+                    char next = s[i + 1];
+                    if (next == '\\') { sb.Append('\\'); i++; }
+                    else if (next == '"') { sb.Append('"'); i++; }
+                    else if (next == 'n') { sb.Append('\n'); i++; }
+                    else if (next == 'r') { sb.Append('\r'); i++; }
+                    else if (next == 't') { sb.Append('\t'); i++; }
+                    else { sb.Append(s[i]); }
+                }
+                else
+                {
+                    sb.Append(s[i]);
+                }
+            }
+            return sb.ToString();
         }
 
         private static string ExtractJsonString(string json, string key, string def)
@@ -236,23 +287,33 @@ namespace UniversalPeripheralBatteryMonitor
             if (colon < 0) return def;
             int q1 = json.IndexOf('"', colon);
             if (q1 < 0) return def;
-            int q2 = json.IndexOf('"', q1 + 1);
+
+            int q2 = -1;
+            for (int i = q1 + 1; i < json.Length; i++)
+            {
+                if (json[i] == '\\') { i++; continue; }
+                if (json[i] == '"') { q2 = i; break; }
+            }
             if (q2 < 0) return def;
-            return json.Substring(q1 + 1, q2 - q1 - 1);
+            string raw = json.Substring(q1 + 1, q2 - q1 - 1);
+            return UnescapeJson(raw);
         }
 
-        private static int ExtractJsonInt(string json, string key, int def)
+        private static int ExtractJsonInt(string json, string key, int def, int min, int max)
         {
             int idx = json.IndexOf("\"" + key + "\"", StringComparison.OrdinalIgnoreCase);
-            if (idx < 0) return def;
+            if (idx < 0) return Math.Min(max, Math.Max(min, def));
             int colon = json.IndexOf(':', idx);
-            if (colon < 0) return def;
+            if (colon < 0) return Math.Min(max, Math.Max(min, def));
             int end = json.IndexOfAny(new char[] { ',', '}', '\r', '\n' }, colon + 1);
             if (end < 0) end = json.Length;
             string numStr = json.Substring(colon + 1, end - colon - 1).Trim();
             int res;
-            if (int.TryParse(numStr, out res)) return res;
-            return def;
+            if (int.TryParse(numStr, out res))
+            {
+                return Math.Min(max, Math.Max(min, res));
+            }
+            return Math.Min(max, Math.Max(min, def));
         }
     }
 
@@ -393,7 +454,7 @@ namespace UniversalPeripheralBatteryMonitor
 
             // Setup Timer
             _pollTimer = new System.Windows.Forms.Timer();
-            _pollTimer.Interval = Math.Max(10000, _settings.PollIntervalSeconds * 1000);
+            _pollTimer.Interval = Math.Min(3600000, Math.Max(10000, _settings.PollIntervalSeconds * 1000));
             _pollTimer.Tick += delegate { PerformPollAsync(); };
             _pollTimer.Start();
 
@@ -410,7 +471,7 @@ namespace UniversalPeripheralBatteryMonitor
                 item.Checked = true;
                 _settings.PollIntervalSeconds = seconds;
                 _settings.Save();
-                _pollTimer.Interval = _settings.PollIntervalSeconds * 1000;
+                _pollTimer.Interval = Math.Min(3600000, Math.Max(10000, _settings.PollIntervalSeconds * 1000));
             };
             parent.DropDownItems.Add(item);
         }
@@ -594,7 +655,7 @@ namespace UniversalPeripheralBatteryMonitor
                                 }
                                 catch (Exception uiEx)
                                 {
-                                    try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), "UI update error: " + uiEx.ToString()); } catch { }
+                                    AppPaths.LogError("crash.log", "UI update error", uiEx);
                                 }
                             });
                         }
@@ -603,7 +664,7 @@ namespace UniversalPeripheralBatteryMonitor
                 }
                 catch (Exception bgEx)
                 {
-                    try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), "Background poll error: " + bgEx.ToString()); } catch { }
+                    AppPaths.LogError("crash.log", "Background poll error", bgEx);
                 }
             });
         }
@@ -746,7 +807,7 @@ namespace UniversalPeripheralBatteryMonitor
                 _setupDialog = new SetupDialog(_settings, _detectedDevices, delegate
                 {
                     _settings.Save();
-                    _pollTimer.Interval = Math.Max(10000, _settings.PollIntervalSeconds * 1000);
+                    _pollTimer.Interval = Math.Min(3600000, Math.Max(10000, _settings.PollIntervalSeconds * 1000));
                     UpdateTrayVisibility();
                     PerformPollAsync();
                 });
@@ -1050,6 +1111,9 @@ namespace UniversalPeripheralBatteryMonitor
 
         [DllImport("setupapi.dll", SetLastError = true)]
         static extern bool SetupDiEnumDeviceInfo(IntPtr DeviceInfoSet, uint MemberIndex, ref SP_DEVINFO_DATA DeviceInfoData);
+
+        [DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern bool SetupDiGetDeviceInstanceId(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, StringBuilder DeviceInstanceId, uint DeviceInstanceIdSize, out uint RequiredSize);
 
         [DllImport("setupapi.dll", SetLastError = true)]
         static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
@@ -1417,12 +1481,6 @@ namespace UniversalPeripheralBatteryMonitor
             // 5. Scan Generic HID standard battery page (UsagePage 0x85)
             ScanGenericHidBatteryDevices(list, seen, hid);
 
-            // 6. Scan custom configured devices
-            if (settings != null && settings.CustomDevices != null)
-            {
-                ScanCustomDevices(list, seen, settings.CustomDevices, hid);
-            }
-
             return list;
         }
 
@@ -1461,7 +1519,18 @@ namespace UniversalPeripheralBatteryMonitor
                         int pct = propBuf[0];
                         if (pct >= 0 && pct <= 100)
                         {
-                            string id = "pnp:" + name.ToLower().Trim();
+                            StringBuilder sbInstId = new StringBuilder(512);
+                            uint instReqSize;
+                            string id;
+                            if (SetupDiGetDeviceInstanceId(hDevInfo, ref devData, sbInstId, (uint)sbInstId.Capacity, out instReqSize) && sbInstId.Length > 0)
+                            {
+                                id = "pnp:" + sbInstId.ToString().ToLower().Trim();
+                            }
+                            else
+                            {
+                                id = "pnp:" + name.ToLower().Trim();
+                            }
+
                             if (!seen.ContainsKey(id))
                             {
                                 seen[id] = true;
@@ -1512,11 +1581,25 @@ namespace UniversalPeripheralBatteryMonitor
 
                     PeripheralDevice dev = new PeripheralDevice();
                     dev.Id = devId;
-                    dev.Name = "Keychron M6 Wireless Mouse";
-                    dev.Category = DeviceCategory.Mouse;
                     dev.ConnectionType = "2.4GHz Dongle (Keychron Link)";
                     dev.HardwarePath = e.DevicePath;
                     dev.Protocol = "Keychron 0xFFC1 (0xB3/0xB4)";
+
+                    if (e.Usage == 6)
+                    {
+                        dev.Category = DeviceCategory.Keyboard;
+                        dev.Name = "Keychron Wireless Keyboard";
+                    }
+                    else if (e.Usage == 2)
+                    {
+                        dev.Category = DeviceCategory.Mouse;
+                        dev.Name = "Keychron Wireless Mouse";
+                    }
+                    else
+                    {
+                        dev.Category = DeviceCategory.Mouse;
+                        dev.Name = "Keychron M6 Wireless Mouse";
+                    }
 
                     if (resp != null)
                     {
@@ -1593,7 +1676,7 @@ namespace UniversalPeripheralBatteryMonitor
                         dev.ConnectionType = "Logitech Unifying/Lightspeed";
                         dev.Protocol = "Logitech HID++";
                         dev.HardwarePath = e.DevicePath;
-                        dev.Category = devIndex == 1 ? DeviceCategory.Mouse : DeviceCategory.Keyboard;
+                        dev.Category = e.Usage == 6 ? DeviceCategory.Keyboard : (e.Usage == 2 ? DeviceCategory.Mouse : (devIndex == 1 ? DeviceCategory.Mouse : DeviceCategory.Keyboard));
                         dev.StatusMessage = "Active - " + pct + "%";
                         list.Add(dev);
                     }
@@ -1699,71 +1782,6 @@ namespace UniversalPeripheralBatteryMonitor
                 finally
                 {
                     CloseHandle(hDev);
-                }
-            }
-        }
-
-        private static void ScanCustomDevices(List<PeripheralDevice> list, Dictionary<string, bool> seen, List<CustomDeviceConfig> customConfigs, List<HidEntry> hid)
-        {
-            if (customConfigs == null || customConfigs.Count == 0) return;
-
-            foreach (CustomDeviceConfig cfg in customConfigs)
-            {
-                // Validate config-supplied values before they drive any I/O.
-                if (cfg == null || string.IsNullOrEmpty(cfg.Name)) continue;
-                if (cfg.BatteryByteOffset < 0 || cfg.BatteryByteOffset >= 4096) continue;
-
-                string devId = "custom:" + cfg.Name.ToLower();
-                if (seen.ContainsKey(devId)) continue;
-
-                foreach (HidEntry e in hid)
-                {
-                    if (e.Vid != cfg.VendorId || e.Pid != cfg.ProductId) continue;
-                    if (cfg.UsagePage != 0 && e.UsagePage != cfg.UsagePage) continue;
-                    if (e.InLen == 0 || e.OutLen == 0) continue;
-                    if (cfg.BatteryByteOffset >= e.InLen) continue;
-
-                    IntPtr hDev = OpenHid(e.DevicePath, GENERIC_READ | GENERIC_WRITE);
-                    if (!IsValidHandle(hDev)) continue;
-
-                    try
-                    {
-                        // Exact report lengths from the device's own descriptor (never larger than it declares).
-                        byte[] outReport = new byte[e.OutLen];
-                        outReport[0] = cfg.QueryReportId;
-                        if (cfg.QueryPayload != null)
-                        {
-                            for (int i = 0; i < cfg.QueryPayload.Length && i + 1 < outReport.Length; i++)
-                                outReport[i + 1] = cfg.QueryPayload[i];
-                        }
-
-                        CustomDeviceConfig c = cfg;
-                        byte[] resp = HidTransact(hDev, outReport, e.InLen, 500, 2000, false,
-                            d => d.Length > c.BatteryByteOffset && d[0] == c.ExpectedResponseReportId);
-                        if (resp == null) continue;
-
-                        int pct = resp[cfg.BatteryByteOffset];
-                        if (pct < 0 || pct > 100) continue;
-
-                        seen[devId] = true;
-                        PeripheralDevice dev = new PeripheralDevice();
-                        dev.Id = devId;
-                        dev.Name = cfg.Name;
-                        dev.BatteryPercentage = pct;
-                        dev.IsConnected = true;
-                        dev.ConnectionType = "Custom 2.4G Receiver";
-                        dev.Protocol = "Custom Query";
-                        dev.HardwarePath = e.DevicePath;
-                        dev.Category = cfg.Category;
-                        dev.StatusMessage = "Active - " + pct + "%";
-                        list.Add(dev);
-                    }
-                    finally
-                    {
-                        CloseHandle(hDev);
-                    }
-
-                    if (seen.ContainsKey(devId)) break;
                 }
             }
         }
@@ -1984,6 +2002,12 @@ namespace UniversalPeripheralBatteryMonitor
         private void InitializeUI()
         {
             this.Text = "Universal Peripheral Battery Monitor - Setup";
+            try
+            {
+                Icon appIco = AppPaths.GetAppIcon();
+                if (appIco != null) this.Icon = appIco;
+            }
+            catch { }
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = false;
@@ -2310,6 +2334,12 @@ namespace UniversalPeripheralBatteryMonitor
         private void InitializeUI()
         {
             this.Text = "Universal Peripheral Battery Dashboard";
+            try
+            {
+                Icon appIco = AppPaths.GetAppIcon();
+                if (appIco != null) this.Icon = appIco;
+            }
+            catch { }
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = true;
